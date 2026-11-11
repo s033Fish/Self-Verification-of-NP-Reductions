@@ -28,7 +28,6 @@ class ThreeSat(Problem):
     """
 
     name = "3-SAT"
-    
     # num_vars <= 3: every set of distinct clauses (259 formulas). Only one is
     # unsatisfiable (all 8 clauses on 3 variables), so random_instance is what
     # supplies most no-instances; test reductions with both.

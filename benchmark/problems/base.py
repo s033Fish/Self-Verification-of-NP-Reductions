@@ -1,8 +1,24 @@
 """The interface every benchmark problem implements, and shared conventions.
 
-A problem is a class whose methods are classmethods.
+A problem is a class, never instantiated, whose methods are classmethods:
 
-Two different "sizes" appear below:
+    class VertexCover(Problem):
+        '''<instance format, yes-condition and edge cases: the agent reads this>'''
+        name = "Vertex Cover"
+        exhaustive_scale = 5
+
+        @classmethod
+        def validate(cls, instance): ...
+        @classmethod
+        def is_yes(cls, instance): ...
+        @classmethod
+        def size(cls, instance): ...
+        @classmethod
+        def random_instance(cls, rng, scale): ...
+        @classmethod
+        def enumerate_instances(cls, scale): ...
+
+Two different "sizes" appear below, and they are not the same thing:
 
 * scale  A small problem-specific knob that says how big an instance to
          make: the number of vertices for a graph problem, the number of
@@ -13,15 +29,16 @@ Two different "sizes" appear below:
          size(x) to flag non-polynomial blowup.
 
 Conventions shared by all problems (the docstrings repeat what each needs):
-- Instances are plain JSON-serialisable dicts: ints, lists and dicts only.
-- Integers are real ints.
-- Graphs are {"n": n, "edges": [[u, v], ...]}: vertices 0..n-1, undirected,
+
+* Instances are plain JSON-serialisable dicts: ints, lists and dicts only.
+* Integers are real ints; True and False are rejected.
+* Graphs are {"n": n, "edges": [[u, v], ...]}: vertices 0..n-1, undirected,
   no self-loops and no duplicate edges ([u, v] and [v, u] are the same edge).
   Edge order does not matter.
-- CNF formulas use DIMACS-style literals: variables 1..m, a literal is +v or
+* CNF formulas use DIMACS-style literals: variables 1..m, a literal is +v or
   -v, a clause is a list of literals. The empty formula is satisfiable; a
   formula containing an empty clause is not.
-- Budgets are named k, and every docstring says whether the condition is
+* Budgets are named k, and every docstring says whether the condition is
   "at most k", "at least k" or "exactly k".
 
 This module uses only the standard library, so make_task.py can copy it into
@@ -50,6 +67,7 @@ _REQUIRED_METHODS = (
 
 class InvalidInstance(ValueError):
     """An instance that does not follow its problem's format."""
+
 
 class Problem(ABC):
     """Base class for benchmark problems. Subclasses set `name`,
@@ -193,6 +211,7 @@ def canonical(instance: Instance) -> str:
 
 
 # --- Conformance check -------------------------------------------------------
+
 
 def check_problem(
     problem: type[Problem],
