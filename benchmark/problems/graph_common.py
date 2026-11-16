@@ -116,24 +116,22 @@ def max_independent_set_size(n: int, adj: list[int]) -> int:
     memo: dict[int, int] = {}
 
     def solve(mask: int) -> int:
+        taken = 0
+        changed = True
+        while changed:  # take every vertex of degree 0 or 1, iteratively
+            changed = False
+            for v in vertices(mask):
+                if mask >> v & 1 and (adj[v] & mask).bit_count() <= 1:
+                    taken += 1
+                    mask &= ~(1 << v) & ~adj[v]
+                    changed = True
         if not mask:
-            return 0
-        if mask in memo:
-            return memo[mask]
-        branch_vertex, branch_degree = -1, -1
-        for v in vertices(mask):
-            degree = (adj[v] & mask).bit_count()
-            if degree <= 1:
-                result = 1 + solve(mask & ~(1 << v) & ~adj[v])
-                memo[mask] = result
-                return result
-            if degree > branch_degree:
-                branch_vertex, branch_degree = v, degree
-        v = branch_vertex
-        without = mask & ~(1 << v)
-        result = max(solve(without), 1 + solve(without & ~adj[v]))
-        memo[mask] = result
-        return result
+            return taken
+        if mask not in memo:
+            v = max(vertices(mask), key=lambda u: (adj[u] & mask).bit_count())
+            without = mask & ~(1 << v)
+            memo[mask] = max(solve(without), 1 + solve(without & ~adj[v]))
+        return taken + memo[mask]
 
     return solve((1 << n) - 1)
 

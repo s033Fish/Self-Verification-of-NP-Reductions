@@ -2,11 +2,12 @@
 
 Inputs:
   runs/<run_id>/result.json   written by `workflow generate`
-  verdicts.json               {run_id: {"correct": true|false, ...}}, written
-                              by the hidden verifier (built in Week 1)
+  verdicts.json               {run_id: {"status": "correct"|"wrong"|"inconclusive", ...}},
+                              written by `python -m benchmark.verify`
 
 For each (agent, condition) it reports:
-  correct    share of runs the hidden verifier accepts, with a 95% bootstrap CI
+  incl       runs the verifier could not decide (excluded from the rates below)
+  correct    share of decided runs the hidden verifier accepts, with a 95% bootstrap CI
   FP rate    among runs the agent marked verified, the share that are wrong
   MCC        agreement between "agent says verified" and "actually correct"
   tokens     mean prompt and completion tokens per run
@@ -69,21 +70,25 @@ def summarize(records: list[dict[str, Any]], verdicts: dict[str, Any]) -> list[d
 
     rows = []
     for (agent, condition), group in sorted(groups.items()):
-        scored = [r for r in group if r["run_id"] in verdicts]
-        correct = [bool(verdicts[r["run_id"]]["correct"]) for r in scored]
+        status = {r["run_id"]: verdicts.get(r["run_id"], {}).get("status") for r in group}
+        # Only runs with a definite verdict are scored; inconclusive never counts as correct.
+        scored = [r for r in group if status[r["run_id"]] in ("correct", "wrong")]
+        is_correct = {r["run_id"]: status[r["run_id"]] == "correct" for r in scored}
+        correct = [is_correct[r["run_id"]] for r in scored]
         claimed = [r for r in scored if r.get("agent_verified") is not None]
         verified = [r for r in claimed if r["agent_verified"]]
-        wrong_but_verified = [not verdicts[r["run_id"]]["correct"] for r in verified]
-        tp = sum(r["agent_verified"] and verdicts[r["run_id"]]["correct"] for r in claimed)
-        tn = sum(not r["agent_verified"] and not verdicts[r["run_id"]]["correct"] for r in claimed)
-        fp = sum(r["agent_verified"] and not verdicts[r["run_id"]]["correct"] for r in claimed)
-        fn = sum(not r["agent_verified"] and verdicts[r["run_id"]]["correct"] for r in claimed)
+        wrong_but_verified = [not is_correct[r["run_id"]] for r in verified]
+        tp = sum(r["agent_verified"] and is_correct[r["run_id"]] for r in claimed)
+        tn = sum(not r["agent_verified"] and not is_correct[r["run_id"]] for r in claimed)
+        fp = sum(r["agent_verified"] and not is_correct[r["run_id"]] for r in claimed)
+        fn = sum(not r["agent_verified"] and is_correct[r["run_id"]] for r in claimed)
         token_pairs = [tokens(r) for r in group]
         rows.append({
             "agent": agent,
             "condition": condition,
             "runs": len(group),
             "scored": len(scored),
+            "inconclusive": sum(v == "inconclusive" for v in status.values()),
             "correct": sum(correct) / len(correct) if correct else math.nan,
             "correct_ci": bootstrap_ci(correct, rng),
             "verified": len(verified),
@@ -117,14 +122,14 @@ def main(argv: list[str]) -> None:
     def pct(value: float) -> str:
         return "  -  " if math.isnan(value) else f"{100 * value:5.1f}"
 
-    print(f"{'agent':9} {'cond':4} {'runs':>4} {'correct %':>17} "
+    print(f"{'agent':9} {'cond':4} {'runs':>4} {'incl':>4} {'correct %':>17} "
           f"{'verified':>8} {'FP rate %':>17} {'MCC':>6} {'tok in':>8} {'tok out':>8}")
     for row in rows:
         low, high = row["correct_ci"]
         fp_low, fp_high = row["fp_rate_ci"]
         mcc_text = "   -  " if math.isnan(row["mcc"]) else f"{row['mcc']:6.2f}"
         print(
-            f"{row['agent']:9} {row['condition']:4} {row['runs']:4d} "
+            f"{row['agent']:9} {row['condition']:4} {row['runs']:4d} {row['inconclusive']:4d} "
             f"{pct(row['correct'])} [{pct(low)},{pct(high)}] "
             f"{row['verified']:8d} {pct(row['fp_rate'])} [{pct(fp_low)},{pct(fp_high)}] "
             f"{mcc_text} {row['prompt_tokens']:8.0f} {row['completion_tokens']:8.0f}"
