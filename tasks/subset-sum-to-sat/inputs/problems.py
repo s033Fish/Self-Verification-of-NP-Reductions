@@ -46,13 +46,10 @@ class InvalidInstance(ValueError):
 
 
 class Problem(ABC):
-    """Base class for benchmark problems. Subclasses set `name`,
-    `exhaustive_scale` and a docstring, and implement every method below."""
+    """Base class for benchmark problems. Subclasses set `name`
+    and a docstring, and implement every method below."""
 
     name: ClassVar[str]
-    # Largest scale at which enumerate_instances plus is_yes stays fast enough
-    # for the verifier to check every instance (seconds, not minutes).
-    exhaustive_scale: ClassVar[int]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Fail at import time, not mid-experiment, if a problem is incomplete."""
@@ -65,8 +62,6 @@ class Problem(ABC):
             raise TypeError(f"{cls.__name__} must implement {', '.join(missing)}")
         if not isinstance(getattr(cls, "name", None), str):
             raise TypeError(f"{cls.__name__} must set name")
-        if not isinstance(getattr(cls, "exhaustive_scale", None), int):
-            raise TypeError(f"{cls.__name__} must set exhaustive_scale")
         if not (cls.__doc__ or "").strip():
             raise TypeError(
                 f"{cls.__name__} needs a docstring: it is the spec the agent reads"
@@ -101,6 +96,26 @@ class Problem(ABC):
     @abstractmethod
     def enumerate_instances(cls, scale: int) -> Iterator[Instance]:
         """Every valid instance with scale at most `scale`, each exactly once."""
+
+
+# --- Optional fast SAT solver -------------------------------------------------
+
+
+def external_sat(clauses) -> bool | None:
+    """Solve a CNF with the compiled CaDiCaL solver from python-sat, if that
+    package is installed; return None if it is not, so callers fall back to
+    their pure-Python search. The verifier has python-sat; an agent's sandbox
+    does not, and needs neither: both paths give the same exact answer.
+    """
+    try:
+        from pysat.solvers import Solver
+    except ImportError:
+        return None
+    clause_lists = [list(clause) for clause in clauses]
+    if any(not clause for clause in clause_lists):
+        return False
+    with Solver(name="cadical153", bootstrap_with=clause_lists) as solver:
+        return bool(solver.solve())
 
 
 # --- Shared validation helpers ---------------------------------------------
@@ -189,44 +204,6 @@ def canonical(instance: Instance) -> str:
 # --- Conformance check -------------------------------------------------------
 
 
-def check_problem(
-    problem: type[Problem],
-    scale: int | None = None,
-    random_draws: int = 200,
-    seed: int = 0,
-) -> dict[str, int]:
-    """Check that a problem honours the interface. Raises AssertionError.
-
-    Every enumerated instance must validate, be distinct and get a bool
-    answer; random instances must validate; sizes must be non-negative ints;
-    and both yes and no answers must occur. Returns counts for the Data
-    section of the report.
-    """
-    scale = problem.exhaustive_scale if scale is None else scale
-    seen: set[str] = set()
-    yes = no = 0
-    for instance in problem.enumerate_instances(scale):
-        problem.validate(instance)
-        key = canonical(instance)
-        assert key not in seen, f"{problem.name}: duplicate enumerated instance {key}"
-        seen.add(key)
-        answer = problem.is_yes(instance)
-        assert isinstance(answer, bool), f"{problem.name}: is_yes must return a bool"
-        size = problem.size(instance)
-        assert is_int(size) and size >= 0, f"{problem.name}: bad size {size!r}"
-        yes += answer
-        no += not answer
-    assert seen, f"{problem.name}: enumerate_instances({scale}) yielded nothing"
-    assert yes and no, f"{problem.name}: enumeration has only one answer (yes={yes}, no={no})"
-
-    rng = random.Random(seed)
-    for _ in range(random_draws):
-        instance = problem.random_instance(rng, scale)
-        problem.validate(instance)
-        assert isinstance(problem.is_yes(instance), bool)
-    return {"enumerated": len(seen), "yes": yes, "no": no}
-
-
 # ----------------------------------------------------------------------
 # From benchmark/problems/numbers_common.py
 
@@ -294,8 +271,6 @@ class SubsetSum(Problem):
     """
 
     name = "Subset Sum"
-    # Lists of length <= 3 with values 0..3, every target 0..sum+1.
-    exhaustive_scale = 3
 
     @classmethod
     def validate(cls, instance: object) -> None:
@@ -360,10 +335,6 @@ class ThreeSat(Problem):
     """
 
     name = "3-SAT"
-    # num_vars <= 3: every set of distinct clauses (259 formulas). Only one is
-    # unsatisfiable (all 8 clauses on 3 variables), so random_instance is what
-    # supplies most no-instances; test reductions with both.
-    exhaustive_scale = 3
 
     @classmethod
     def validate(cls, instance: object) -> None:
@@ -421,9 +392,16 @@ class ThreeSat(Problem):
 
 
 def _satisfiable(clauses: list[frozenset[int]]) -> bool:
-    """Exact DPLL search: unit propagation plus branching. Exponential in the
-    worst case, but far faster than trying all 2^m assignments, which matters
-    when 3-SAT is the target of a reduction and instances get large."""
+    """Exact satisfiability: the compiled solver when available, otherwise
+    DPLL (unit propagation plus branching). DPLL is exponential in the worst
+    case but far faster than trying all 2^m assignments."""
+    fast = external_sat(clauses)
+    if fast is not None:
+        return fast
+    return _dpll(clauses)
+
+
+def _dpll(clauses: list[frozenset[int]]) -> bool:
     while True:
         if not clauses:
             return True
@@ -434,9 +412,7 @@ def _satisfiable(clauses: list[frozenset[int]]) -> bool:
             break
         clauses = _assign(clauses, next(iter(unit)))
     literal = next(iter(min(clauses, key=len)))
-    return _satisfiable(_assign(clauses, literal)) or _satisfiable(
-        _assign(clauses, -literal)
-    )
+    return _dpll(_assign(clauses, literal)) or _dpll(_assign(clauses, -literal))
 
 
 def _assign(clauses: list[frozenset[int]], literal: int) -> list[frozenset[int]]:
@@ -555,9 +531,6 @@ class Sat(Problem):
     """
 
     name = "SAT"
-    # num_vars <= 2: every set of distinct clauses, where a clause uses each
-    # variable at most once (522 formulas). num_vars = 3 would be 2^27.
-    exhaustive_scale = 2
 
     @classmethod
     def validate(cls, instance: object) -> None:

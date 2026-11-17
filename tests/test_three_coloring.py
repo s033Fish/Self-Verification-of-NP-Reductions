@@ -60,3 +60,18 @@ def test_malformed_instances_are_rejected(instance):
 
 def test_size():
     assert ThreeColoring.size({"n": 4, "edges": K4}) == 10
+
+
+def test_pure_python_fallback_matches_reference():
+    """Agents' sandboxes lack python-sat, so problems.py falls back to search."""
+    from benchmark.problems.graph_common import _three_colourable_search, adjacency
+
+    rng = random.Random(1)
+    instances = list(ThreeColoring.enumerate_instances(5)) + [
+        ThreeColoring.random_instance(rng, rng.randint(5, 9)) for _ in range(200)
+    ]
+    for instance in instances:
+        n = instance["n"]
+        assert _three_colourable_search(n, adjacency(n, instance["edges"])) == (
+            reference.three_coloring(**instance)
+        )

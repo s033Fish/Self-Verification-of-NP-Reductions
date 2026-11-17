@@ -1,8 +1,19 @@
-"""Run authored tasks through the original pinned mini-SWE-agent scaffold."""
+"""Generate agent runs: tasks x agents x conditions x seeds, in parallel on Modal.
+
+Each run is written to runs/<run_id>/ with result.json and the files the agent
+left (reduce.py, verdict.json, test_reduce.py). Runs that already exist are
+skipped, so an interrupted batch resumes where it stopped.
+
+    uv run python -m workflow generate --split dev --conditions c1 c3 --seeds 1
+
+Adapted from the Assignment 2 `workflow/generate.py`. Runs go out in
+parallel and are saved as they finish; the runner caps concurrency.
+"""
 
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import shutil
 import tempfile
@@ -18,8 +29,13 @@ from .tasks import REPO, ReductionTask, load_tasks
 
 RUNNER_APP = "reductions-agent-runner"
 RUNNER_FUNCTION = "run_task"
-CONDITIONS = ("c1", "c2", "c3", "c4", "c5")
-IMPLEMENTED = ("c1", "c2", "c3")
+CONDITIONS = ("c1", "c2", "c3", "c3n", "c4", "c5")
+IMPLEMENTED = ("c1", "c2", "c3", "c3n")
+# Conditions whose agents get problems_nosolver.py (specs and validate() only)
+# as their problems.py. The verifier always judges with the full library.
+NO_SOLVER_CONDITIONS = {"c3n", "c5"}
+NOSOLVER_FILE = "problems_nosolver.py"
+
 
 @dataclass(frozen=True)
 class Job:
@@ -28,7 +44,7 @@ class Job:
     agent: Agent
     condition: str
     seed: int
-    sample: int | None = None
+    sample: int | None = None  # best-of-k sample index, c2 only
 
     @property
     def run_id(self) -> str:
@@ -70,22 +86,43 @@ def build_jobs(
     return jobs
 
 
+def problem_spec(task: ReductionTask) -> str:
+    """The SOURCE and TARGET docstrings, as the agent sees them in the prompt.
+    Taken from the trusted library, which make_task bundles into problems.py."""
+    from benchmark.problems import PROBLEMS
+
+    by_name = {problem.name: problem for problem in PROBLEMS.values()}
+    parts = []
+    for role, name in (("SOURCE", task.source_problem), ("TARGET", task.target_problem)):
+        problem = by_name[name]
+        parts.append(f"{role} = {problem.__name__}\n{inspect.cleandoc(problem.__doc__ or '')}")
+    return "\n\n".join(parts)
+
+
 def build_request(job: Job) -> dict[str, Any]:
     task = job.task
+    input_files = {
+        item.name: (job.descriptor.parent / item.path).read_bytes() for item in task.inputs
+    }
+    solvers_provided = job.condition not in NO_SOLVER_CONDITIONS
+    if not solvers_provided:
+        input_files["problems.py"] = (
+            job.descriptor.parent / "inputs" / NOSOLVER_FILE
+        ).read_bytes()
     return {
         "run_id": job.run_id,
         "task": {
             "task_id": task.task_id,
             "instructions": task.instructions,
             "inputs": [item.model_dump() for item in task.inputs],
+            "spec": problem_spec(task),
+            "solvers_provided": solvers_provided,
         },
         "model": job.agent.model,
         "condition": job.condition,
         "temperature": job.agent.temperature,
-        "input_files": {
-            item.name: (job.descriptor.parent / item.path).read_bytes()
-            for item in task.inputs
-        },
+        "max_tokens": job.agent.max_tokens,
+        "input_files": input_files,
     }
 
 
@@ -107,14 +144,16 @@ def write_result(job: Job, runs: Path, result: dict[str, Any]) -> Path:
             "split": job.task.split,
             "agent": {"key": job.agent.key, "model": job.agent.model},
             "condition": job.condition,
+            "solvers_provided": job.condition not in NO_SOLVER_CONDITIONS,
             "seed": job.seed,
             "sample": job.sample,
             "files_present": {name: text is not None for name, text in files.items()},
             **{
                 key: _json_safe(result.get(key))
                 for key in (
-                    "temperature", "step_limit", "scaffold", "agent_verified",
-                    "usage", "elapsed_seconds", "prompt", "outcome", "trajectory",
+                    "exit_status", "temperature", "max_tokens", "step_limit", "scaffold", "agent_verified",
+                    "usage", "replies_without_tool_calls", "elapsed_seconds", "prompt",
+                    "outcome", "trajectory",
                 )
             },
         }
@@ -174,14 +213,24 @@ def main(argv: list[str]) -> None:
         return
 
     remote = modal.Function.from_name(RUNNER_APP, RUNNER_FUNCTION)
-    calls = [(job, remote.spawn(build_request(job))) for job in pending]
+    by_run_id = {job.run_id: job for job in pending}
     failures = 0
-    for job, call in tqdm(calls, unit="run"):
-        try:
-            written = write_result(job, arguments.runs, call.get())
-            tqdm.write(f"wrote {written.name}")
-        except Exception as error:
+    # order_outputs=False: each run is saved as soon as it finishes. The runner
+    # returns failures as {"run_id", "error"} instead of raising.
+    results = remote.map(
+        [build_request(job) for job in pending],
+        order_outputs=False,
+        return_exceptions=True,
+    )
+    for result in tqdm(results, total=len(pending), unit="run"):
+        if isinstance(result, BaseException) or result.get("error"):
             failures += 1
-            tqdm.write(f"ERROR {job.run_id}: {error}")
+            run_id = None if isinstance(result, BaseException) else result.get("run_id")
+            message = result if isinstance(result, BaseException) else result["error"]
+            tqdm.write(f"ERROR {run_id or '(unknown run)'}: {message}")
+            continue
+        job = by_run_id[result["run_id"]]
+        written = write_result(job, arguments.runs, result)
+        tqdm.write(f"wrote {written.name}  [{result.get('exit_status') or 'no exit status'}]")
     if failures:
         raise SystemExit(f"{failures} run(s) failed; rerun the same command to resume")

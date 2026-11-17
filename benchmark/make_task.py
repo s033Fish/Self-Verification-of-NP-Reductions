@@ -3,8 +3,9 @@
 For each pair in benchmark/pairs.json this writes
 
     tasks/<source>-to-<target>/
-        task.json             descriptor read by `workflow generate`
-        inputs/problems.py    the two problems, bundled into one file
+        task.json                     descriptor read by `workflow generate`
+        inputs/problems.py            the two problems, bundled into one file
+        inputs/problems_nosolver.py   specs and validate() only (condition c3n)
 
 problems.py is self-contained: it holds base.py, the helper modules the two
 problems need and the two problem classes, with the package's relative
@@ -15,6 +16,12 @@ the library, so a bundling bug fails here rather than mid-experiment.
     uv run python -m benchmark.make_task --all              # every pair
     uv run python -m benchmark.make_task three_sat clique   # one pair
     uv run python -m benchmark.make_task --list             # problem keys
+
+problems_nosolver.py is what agents see as problems.py in the no-solver
+setting: each problem's docstring and validate(), plus the validation
+helpers they call, and nothing else. No is_yes, no generators and no solver
+helpers, so an agent that wants to test must write its own solvers from its
+own reading of the spec.
 
 Edit the library or pairs.json, then regenerate; never edit tasks/ by hand.
 """
@@ -165,9 +172,42 @@ def _top_level_names(tree: ast.Module) -> set[str]:
     return names
 
 
-def _strip(source: str, tree: ast.Module) -> str:
-    """The module without its docstring, `from __future__` and relative imports."""
+# Verifier-only information that must not reach agents: the exhaustive test
+# scale told one agent exactly how far the hidden verifier checks, and it wrote
+# a reduction that was only "polynomial" up to that scale.
+HIDDEN_NAMES = ("exhaustive_scale", "check_problem")
+
+
+def _with_leading_comments(lines: list[str], start: int) -> int:
+    """Extend a 1-based start line upward over the comment lines just above it."""
+    while start > 1 and lines[start - 2].strip().startswith("#"):
+        start -= 1
+    return start
+
+
+def _hidden_lines(source: str, tree: ast.Module) -> set[int]:
+    """Line numbers of everything that reveals how the verifier tests."""
+    lines = source.splitlines()
     drop: set[int] = set()
+    for node in ast.walk(tree):
+        hidden = False
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            hidden = any(isinstance(t, ast.Name) and t.id == "exhaustive_scale" for t in targets)
+        elif isinstance(node, ast.If):
+            hidden = "exhaustive_scale" in (ast.get_source_segment(source, node.test) or "")
+        elif isinstance(node, ast.FunctionDef) and node.name == "check_problem":
+            hidden = True
+        if hidden:
+            assert node.end_lineno is not None
+            drop.update(range(_with_leading_comments(lines, node.lineno), node.end_lineno + 1))
+    return drop
+
+
+def _strip(source: str, tree: ast.Module) -> str:
+    """The module without its docstring, `from __future__`, relative imports
+    and verifier-only details (HIDDEN_NAMES)."""
+    drop: set[int] = _hidden_lines(source, tree)
     for index, node in enumerate(tree.body):
         is_docstring = (
             index == 0
@@ -183,7 +223,11 @@ def _strip(source: str, tree: ast.Module) -> str:
             drop.update(range(node.lineno, node.end_lineno + 1))
     lines = source.splitlines()
     kept = [line for number, line in enumerate(lines, start=1) if number not in drop]
-    return "\n".join(kept).strip("\n")
+    text = "\n".join(kept).strip("\n")
+    return text.replace(
+        "Subclasses set `name`,\n    `exhaustive_scale` and a docstring",
+        "Subclasses set `name`\n    and a docstring",
+    )
 
 
 def bundle(source: type[Problem], target: type[Problem]) -> str:
@@ -230,6 +274,10 @@ def load_bundle(path: Path) -> ModuleType:
 
 def check_bundle(path: Path, source: type[Problem], target: type[Problem]) -> None:
     """The bundled classes must answer exactly like the library's."""
+    text = path.read_text()
+    leaked = [name for name in HIDDEN_NAMES if name in text]
+    if leaked:
+        raise ValueError(f"{path}: verifier-only details leaked into the bundle: {leaked}")
     module = load_bundle(path)
     for alias, problem in (("SOURCE", source), ("TARGET", target)):
         bundled = getattr(module, alias, None)
@@ -240,6 +288,126 @@ def check_bundle(path: Path, source: type[Problem], target: type[Problem]) -> No
             bundled.validate(instance)
             if bundled.is_yes(instance) != problem.is_yes(instance):
                 raise ValueError(f"{path}: bundled {alias} disagrees on {instance}")
+
+
+# --- The no-solver bundle ------------------------------------------------------
+
+NOSOLVER_FILE = "problems_nosolver.py"
+
+# Validation helpers copied into every no-solver bundle, in dependency order.
+VALIDATION_HELPERS = {
+    "base": ["InvalidInstance", "require", "is_int", "require_keys", "require_int",
+             "validate_graph", "validate_cnf"],
+    "graph_common": ["validate_plain_graph", "validate_graph_with_k"],
+    "cnf_common": ["validate_three_literal_formula"],
+    "sets_common": ["validate_set_system"],
+    "numbers_common": ["validate_numbers"],
+}
+
+# Names that must never appear in a no-solver bundle.
+FORBIDDEN_IN_NOSOLVER = (
+    "exhaustive_scale", "check_problem",
+    "is_yes", "random_instance", "enumerate_instances", "external_sat",
+    "_satisfiable", "satisfiable(", "_dpll", "max_independent_set_size",
+    "min_dominating_set_size", "three_colourable", "hamiltonian_path_exists",
+    "hamiltonian_cycle_exists", "min_set_cover", "exact_cover_exists",
+    "subset_sum_reachable",
+)
+
+NOSOLVER_HEADER = '''"""Problem definitions for this task: {source} -> {target}.
+
+SOURCE = {source_class}: {source}, the problem you reduce FROM.
+TARGET = {target_class}: {target}, the problem you reduce TO.
+
+Each class docstring gives the exact instance format, yes-condition and edge
+cases. Instances are plain dicts. Each class has one method:
+
+    validate(instance)    raise InvalidInstance if the instance is malformed
+
+This file does NOT provide solvers or instance generators. To check whether
+two instances have the same answer, write your own from the definitions.
+
+Generated by benchmark/make_task.py from the benchmark's problem library.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+'''
+
+
+def _lines(module: str, node: ast.AST) -> str:
+    """Source lines of a top-level or nested definition, decorators included."""
+    text, _ = _tree(module)
+    starts = [node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])]
+    lines = text.splitlines()[min(starts) - 1 : node.end_lineno]
+    return "\n".join(lines)
+
+
+def _top_level(module: str, name: str) -> str:
+    _, tree = _tree(module)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == name:
+            return _lines(module, node)
+    raise ValueError(f"{name} not found in {module}.py")
+
+
+def _spec_class(problem: type[Problem]) -> str:
+    """The problem as a plain class: its docstring, name and validate()."""
+    module = module_name(problem)
+    _, tree = _tree(module)
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == problem.__name__
+    )
+    docstring = cls.body[0]
+    validate = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "validate"
+    )
+    return (
+        f"class {problem.__name__}:\n"
+        f"{_lines(module, docstring)}\n\n"
+        f"    name = {problem.name!r}\n\n"
+        f"{_lines(module, validate)}\n"
+    )
+
+
+def bundle_nosolver(source: type[Problem], target: type[Problem]) -> str:
+    """problems.py for the no-solver setting: specs and validate() only."""
+    parts = [
+        NOSOLVER_HEADER.format(
+            source=source.name, target=target.name,
+            source_class=source.__name__, target_class=target.__name__,
+        )
+    ]
+    for module, names in VALIDATION_HELPERS.items():
+        parts.append(f"# {'-' * 70}\n# Validation helpers from benchmark/problems/{module}.py\n")
+        parts.extend(_top_level(module, name) + "\n" for name in names)
+    parts.append(f"# {'-' * 70}\n# The two problems\n")
+    parts.append(_spec_class(source))
+    parts.append(_spec_class(target))
+    parts.append(f"SOURCE = {source.__name__}\nTARGET = {target.__name__}\n")
+    return "\n\n".join(parts)
+
+
+def check_nosolver_bundle(path: Path, source: type[Problem], target: type[Problem]) -> None:
+    """Validation must match the library, and no solver may be reachable."""
+    text = path.read_text()
+    leaked = [name for name in FORBIDDEN_IN_NOSOLVER if name in text]
+    if leaked:
+        raise ValueError(f"{path}: solver code leaked into the no-solver bundle: {leaked}")
+    module = load_bundle(path)
+    for alias, problem in (("SOURCE", source), ("TARGET", target)):
+        bundled = getattr(module, alias)
+        if bundled.name != problem.name or bundled.__doc__ != problem.__doc__:
+            raise ValueError(f"{path}: {alias} should be {problem.name} with its docstring")
+        for instance in islice(problem.enumerate_instances(problem.exhaustive_scale), CHECKED_INSTANCES):
+            bundled.validate(instance)
+        try:
+            bundled.validate({})
+        except module.InvalidInstance:
+            pass
+        else:
+            raise ValueError(f"{path}: {alias}.validate accepted an empty dict")
 
 
 # --- Writing tasks --------------------------------------------------------------
@@ -268,6 +436,9 @@ def write_task(pair: Pair, tasks_dir: Path = TASKS_DIR) -> Path:
         json.dumps(descriptor.model_dump(), indent=2) + "\n"
     )
     check_bundle(problems_file, source, target)
+    nosolver_file = task_dir / "inputs" / NOSOLVER_FILE
+    nosolver_file.write_text(bundle_nosolver(source, target))
+    check_nosolver_bundle(nosolver_file, source, target)
     return task_dir
 
 

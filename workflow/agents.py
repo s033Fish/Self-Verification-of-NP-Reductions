@@ -23,6 +23,7 @@ class Agent:
     api_key_variable: str
     default_base_url: str | None = None
     temperature: float = 0.7     # > 0 so repeated seeds differ
+    max_tokens: int = 4096       # output tokens per model call
 
     @property
     def model(self) -> str:
@@ -49,24 +50,30 @@ class Agent:
         return missing
 
 
+# The final pair, chosen on the dev set: DeepSeek V4.1 Flash (strong) and
+# GPT-OSS 120B (mid-strength, largest gain from self-testing). GLM-4.7-Flash
+# (self-hosted) solved 0% of single-shot dev tasks and never finished a
+# self-testing run; GLM 5.3 Flash was at ceiling. Both served by Fireworks.
 AGENTS: tuple[Agent, ...] = (
-    # Self-hosted on Modal (infrastructure/models.py).
-    Agent(
-        key="glm",
-        default_model="zai-org/GLM-4.7-Flash",
-        model_variable=None,
-        base_url_variable="GLM_BASE_URL",
-        api_key_variable="MODAL_PROXY_TOKEN",
-    ),
-    # Fireworks serverless. Set FIREWORKS_MODEL to the exact ID from the
-    # model's Fireworks page, e.g. accounts/fireworks/models/<name>.
     Agent(
         key="deepseek",
-        default_model="",
+        default_model="accounts/fireworks/models/deepseek-v4p1-flash",
         model_variable="FIREWORKS_MODEL",
         base_url_variable="FIREWORKS_BASE_URL",
         api_key_variable="FIREWORKS_API_KEY",
         default_base_url="https://api.fireworks.ai/inference/v1",
+        # Reasons before answering: 4096, then 16384, cut off tool calls while
+        # it designed gadgets for 3-SAT -> 3-Coloring.
+        max_tokens=32768,
+    ),
+    Agent(
+        key="gptoss",
+        default_model="accounts/fireworks/models/gpt-oss-120b",
+        model_variable="FIREWORKS_GPTOSS_MODEL",
+        base_url_variable="FIREWORKS_BASE_URL",
+        api_key_variable="FIREWORKS_API_KEY",
+        default_base_url="https://api.fireworks.ai/inference/v1",
+        max_tokens=16384,
     ),
 )
 AGENT_BY_KEY = {agent.key: agent for agent in AGENTS}

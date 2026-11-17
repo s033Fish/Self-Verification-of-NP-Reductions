@@ -6,7 +6,7 @@ import random
 from collections.abc import Iterator
 from itertools import combinations, product
 
-from .base import Instance, Problem, require, require_keys, validate_cnf
+from .base import Instance, Problem, external_sat, require, require_keys, validate_cnf
 
 
 class ThreeSat(Problem):
@@ -89,9 +89,16 @@ class ThreeSat(Problem):
 
 
 def _satisfiable(clauses: list[frozenset[int]]) -> bool:
-    """Exact DPLL search: unit propagation plus branching. Exponential in the
-    worst case, but far faster than trying all 2^m assignments, which matters
-    when 3-SAT is the target of a reduction and instances get large."""
+    """Exact satisfiability: the compiled solver when available, otherwise
+    DPLL (unit propagation plus branching). DPLL is exponential in the worst
+    case but far faster than trying all 2^m assignments."""
+    fast = external_sat(clauses)
+    if fast is not None:
+        return fast
+    return _dpll(clauses)
+
+
+def _dpll(clauses: list[frozenset[int]]) -> bool:
     while True:
         if not clauses:
             return True
@@ -102,9 +109,7 @@ def _satisfiable(clauses: list[frozenset[int]]) -> bool:
             break
         clauses = _assign(clauses, next(iter(unit)))
     literal = next(iter(min(clauses, key=len)))
-    return _satisfiable(_assign(clauses, literal)) or _satisfiable(
-        _assign(clauses, -literal)
-    )
+    return _dpll(_assign(clauses, literal)) or _dpll(_assign(clauses, -literal))
 
 
 def _assign(clauses: list[frozenset[int]], literal: int) -> list[frozenset[int]]:

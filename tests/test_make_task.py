@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
@@ -46,6 +47,7 @@ def test_every_pair_bundles_and_matches_the_library(pair, tmp_path):
     text = (task_dir / "inputs" / "problems.py").read_text()
     assert "from ." not in text  # no package-relative imports remain
     assert text.count("from __future__") == 1
+    assert "exhaustive_scale" not in text  # the verifier's test scale stays hidden
 
 
 def test_bundle_runs_without_the_benchmark_package(tmp_path):
@@ -87,3 +89,38 @@ def test_bundle_contains_both_docstrings(tmp_path):
     assert module.TARGET.__doc__ == target.__doc__
     check_bundle(path, source, target)
     assert module_name(target) == "dominating_set"
+
+
+def test_nosolver_bundle_has_specs_and_validate_only(tmp_path):
+    """The no-solver setting must leave the agent nothing to solve with."""
+    from benchmark.make_task import FORBIDDEN_IN_NOSOLVER, NOSOLVER_FILE
+
+    pair = next(p for p in PAIRS if p.task_id == "three-sat-to-three-coloring")
+    task_dir = write_task(pair, tmp_path)  # also runs check_nosolver_bundle
+    text = (task_dir / "inputs" / NOSOLVER_FILE).read_text()
+    assert not [name for name in FORBIDDEN_IN_NOSOLVER if name in text]
+    script = (
+        "import problems\n"
+        "problems.SOURCE.validate({'num_vars': 3, 'clauses': [[1, -2, 3]]})\n"
+        "problems.TARGET.validate({'n': 2, 'edges': [[0, 1]]})\n"
+        "assert not hasattr(problems.SOURCE, 'is_yes')\n"
+        "assert not hasattr(problems.TARGET, 'random_instance')\n"
+        "try:\n"
+        "    problems.TARGET.validate({'n': 2, 'edges': [[0, 0]]})\n"
+        "    raise SystemExit('self-loop accepted')\n"
+        "except problems.InvalidInstance:\n"
+        "    print('ok')\n"
+    )
+    (tmp_path / "problems.py").write_text(text)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, '.')\n{script}"],
+        cwd=tmp_path, capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.strip() == "ok"
+
+
+def test_task_json_lists_only_the_agent_visible_file(tmp_path):
+    pair = PAIRS[0]
+    task_dir = write_task(pair, tmp_path)
+    descriptor = json.loads((task_dir / "task.json").read_text())
+    assert [item["name"] for item in descriptor["inputs"]] == ["problems.py"]

@@ -8,6 +8,8 @@ Inputs:
 For each (agent, condition) it reports:
   incl       runs the verifier could not decide (excluded from the rates below)
   correct    share of decided runs the hidden verifier accepts, with a 95% bootstrap CI
+  verified   runs whose verdict.json says verified (c3, c3n, c4, c5; a missing verdict
+             counts as not verified)
   FP rate    among runs the agent marked verified, the share that are wrong
   MCC        agreement between "agent says verified" and "actually correct"
   tokens     mean prompt and completion tokens per run
@@ -31,6 +33,7 @@ from typing import Any
 from .tasks import REPO
 
 BOOTSTRAP_SAMPLES = 2000
+VERIFYING_CONDITIONS = {"c3", "c3n", "c4", "c5"}  # conditions that write verdict.json
 
 
 def mcc(tp: int, tn: int, fp: int, fn: int) -> float:
@@ -75,7 +78,14 @@ def summarize(records: list[dict[str, Any]], verdicts: dict[str, Any]) -> list[d
         scored = [r for r in group if status[r["run_id"]] in ("correct", "wrong")]
         is_correct = {r["run_id"]: status[r["run_id"]] == "correct" for r in scored}
         correct = [is_correct[r["run_id"]] for r in scored]
-        claimed = [r for r in scored if r.get("agent_verified") is not None]
+        # In conditions that ask for verdict.json, a missing or malformed verdict
+        # means the agent did not claim its reduction works: count it as "not
+        # verified" rather than dropping the run. Single-shot conditions make
+        # no claim, so they have no verified column.
+        if condition in VERIFYING_CONDITIONS:
+            claimed = [{**r, "agent_verified": bool(r.get("agent_verified"))} for r in scored]
+        else:
+            claimed = []
         verified = [r for r in claimed if r["agent_verified"]]
         wrong_but_verified = [not is_correct[r["run_id"]] for r in verified]
         tp = sum(r["agent_verified"] and is_correct[r["run_id"]] for r in claimed)

@@ -1,16 +1,19 @@
-"""
-Run one reduction task through the pinned mini-SWE-agent scaffold on Modal.
+"""Run one reduction task through the pinned mini-SWE-agent scaffold on Modal.
 
 Each call gets a fresh container and a temporary workspace holding the task's
 input files. The agent works with one bash tool. When it finishes, the runner
 collects reduce.py (the reduction), verdict.json (the agent's own claim about
 whether its tests pass) and test_reduce.py (its tests), plus token usage.
+
+Adapted from the Assignment 2 `agent_runner.py`: same scaffold, sandbox and
+limits; new prompts, collected files, sampling temperature and usage logging.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -26,11 +29,13 @@ GATEWAY_FUNCTION = "complete"
 
 COMMAND_TIMEOUT_SECONDS = 120
 WALL_TIME_LIMIT_SECONDS = 15 * 60
-MODEL_MAX_TOKENS = 4096
-MAX_CONTAINERS = 16 
+MODEL_MAX_TOKENS = 4096  # default; each agent sets its own (workflow/agents.py)
+MAX_CONTAINERS = 16  # matches the GLM server's concurrent request slots
 
-# Single-shot conditions get a few steps to write the file and submit.
-STEP_LIMITS = {"c1": 3, "c2": 3, "c3": 20}
+# Single-shot conditions may read files but not run code; 6 steps leaves room
+# to read problems.py, write reduce.py and submit. (3 was too few: most runs
+# ended before reduce.py was written.)
+STEP_LIMITS = {"c1": 6, "c2": 6, "c3": 20, "c3n": 20}
 COLLECTED_FILES = ("reduce.py", "verdict.json", "test_reduce.py")
 MAX_COLLECTED_BYTES = 200_000
 
@@ -47,13 +52,13 @@ OUTPUT_SPEC = (
 CONDITION_INSTRUCTIONS = {
     # c1: single shot, no execution.
     "c1": (
-        "Write reduce.py in a single command, without running or testing any "
-        "code, then submit."
+        "You may read files such as problems.py, but do not run, execute or "
+        "test any code. Write reduce.py, then submit."
     ),
     # c2: best-of-k. Each sample is an independent c1-style run.
     "c2": (
-        "Write reduce.py in a single command, without running or testing any "
-        "code, then submit."
+        "You may read files such as problems.py, but do not run, execute or "
+        "test any code. Write reduce.py, then submit."
     ),
     # c3: self-verification. The agent writes and runs its own tests.
     "c3": (
@@ -64,8 +69,18 @@ CONDITION_INSTRUCTIONS = {
         '{"verified": true or false, "tests_run": <int>, "tests_passed": <int>}, '
         "where verified is true only if all of your tests pass. Then submit."
     ),
-    # c4 (oracle counterexamples) and c5 (independent tester) will be added in
-    # Week 2, once the hidden verifier exists.
+    # c3n: self-verification WITHOUT reference solvers. problems.py has only
+    # the specs and validate(), so any solver the agent tests with is its own.
+    "c3n": (
+        "Before submitting, check your reduction. problems.py has no solvers, "
+        "so first write your own brute-force solvers for both problems from the "
+        "definitions above. Then write tests in test_reduce.py that compare your "
+        "solvers' answers on many small source instances and their reductions, "
+        "run them, and revise until the tests pass. Finally write verdict.json as "
+        '{"verified": true or false, "tests_run": <int>, "tests_passed": <int>}, '
+        "where verified is true only if all of your tests pass. Then submit."
+    ),
+    # c4 (oracle counterexamples) and c5 (independent tester) come next.
 }
 
 app = modal.App(APP_NAME)
@@ -76,22 +91,93 @@ image = (
 )
 
 
-def task_prompt(task: dict[str, Any], condition: str) -> str:
+SUBMIT_COMMAND = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+
+
+def recover_tool_call(message: dict[str, Any]) -> str | None:
+    """The bash command a reply clearly meant to run but wrote as text.
+
+    GPT-OSS on Fireworks sometimes puts the tool call in the reply text instead
+    of a real tool call, almost always for the final submit. Only two exact
+    shapes count: a JSON object whose only key is "command", or the bare submit
+    command. Anything else (prose, code blocks) stays a format error.
+    """
+    if message.get("tool_calls"):
+        return None
+    text = (message.get("content") or "").strip()
+    if text == SUBMIT_COMMAND:
+        return text
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    if isinstance(parsed, dict) and set(parsed) == {"command"} and isinstance(parsed["command"], str):
+        return parsed["command"]
+    return None
+
+
+# Every reply must contain a bash tool call; a plain-text "I'm done" reply is a
+# format error, and three in a row end the run. Say exactly how to finish.
+FINISH_INSTRUCTION = (
+    "Every reply must contain exactly one bash tool call. When you are done, "
+    f"finish by running exactly: {SUBMIT_COMMAND}"
+)
+
+NO_CODE_CONDITIONS = {"c1", "c2"}
+_HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\s*\1\b", re.DOTALL)
+_RUNS_CODE = re.compile(r"(?:^|[;&|(`]|\n)\s*(?:sudo\s+)?(?:python\d*(?:\.\d+)?|pytest|pip\d*)\b")
+
+
+def runs_code(command: str) -> bool:
+    """Whether a shell command starts a Python interpreter, pytest or pip.
+    Here-document bodies (file contents being written) are ignored, so a
+    reduce.py that mentions "python" can still be written."""
+    return bool(_RUNS_CODE.search(_HEREDOC.sub("<<heredoc", command)))
+
+
+def task_prompt(task: dict[str, Any], condition: str, workspace: str = ".") -> str:
     if condition not in CONDITION_INSTRUCTIONS:
         raise NotImplementedError(
             f"condition {condition!r} is not implemented yet "
             f"(available: {', '.join(CONDITION_INSTRUCTIONS)})"
         )
-    expected = task["expected_output"]
     inputs = [item["name"] for item in task.get("inputs", [])]
+    spec = task.get("spec")
+    definitions = (
+        "PROBLEM DEFINITIONS (the SOURCE and TARGET docstrings from problems.py, "
+        "complete as given here):\n\n"
+        f"{spec}\n\n"
+        if spec else ""
+    )
+    if task.get("solvers_provided", True):
+        contents = (
+            "problems.py is long (about 500 lines): you do not need to read it to "
+            "know the formats, which are given above. It provides SOURCE and TARGET "
+            "with is_yes(instance), validate(instance) and random_instance(rng, "
+            "scale); search it (e.g. with grep) only if you need something specific."
+        )
+    else:
+        contents = (
+            "problems.py provides SOURCE and TARGET with validate(instance) only. "
+            "It has NO solvers and NO instance generators."
+        )
+    files = (
+        f"WORKING DIRECTORY: {workspace}\n"
+        "All input files are in this directory; run every command from it and "
+        f"write your files here. {contents}\n\n"
+    )
     return (
         f"TASK ID: {task['task_id']}\n\n"
         f"USER REQUEST:\n{task['instructions']}\n\n"
-        f"INPUT FILES: {json.dumps(inputs)}\n\n"
+        f"{definitions}"
+        f"INPUT FILES: {json.dumps(inputs)}\n"
+        f"{files}"
         f"{OUTPUT_SPEC}\n\n"
         f"{CONDITION_INSTRUCTIONS[condition]}\n"
-        "Do not merely describe code: leave the files at those exact paths."
+        "Do not merely describe code: leave the files at those exact paths.\n"
+        f"{FINISH_INSTRUCTION}"
     )
+
 
 def _within_workspace(workspace: Path, relative: str) -> Path:
     candidate = (workspace / relative).resolve()
@@ -100,6 +186,7 @@ def _within_workspace(workspace: Path, relative: str) -> Path:
     ):
         raise ValueError(f"unsafe task path: {relative!r}")
     return candidate
+
 
 def _read_text(path: Path) -> str | None:
     if not path.is_file():
@@ -117,21 +204,57 @@ def _agent_verified(verdict_text: str | None) -> bool | None:
         return None
     return verified if isinstance(verified, bool) else None
 
-@app.function(image=image, timeout=20 * 60, max_containers=MAX_CONTAINERS)
+
+# 30 minutes: the agent's 15-minute wall limit is only checked between steps,
+# so one long model call can carry a run past it.
+@app.function(image=image, timeout=30 * 60, max_containers=MAX_CONTAINERS)
 def run_task(request: dict[str, Any]) -> dict[str, Any]:
+    """Run one task. Never raises: an unexpected failure comes back as
+    {"run_id": ..., "error": ...} so the caller always knows which run failed."""
+    import traceback
+
+    try:
+        return _run_task(request)
+    except Exception as error:
+        return {
+            "run_id": request.get("run_id"),
+            "error": f"{type(error).__name__}: {error}"[:2000],
+            "traceback": traceback.format_exc()[-4000:],
+        }
+
+
+def _run_task(request: dict[str, Any]) -> dict[str, Any]:
     from litellm import ModelResponse
     from minisweagent.agents.default import DefaultAgent
     from minisweagent.config import get_config_from_spec
     from minisweagent.environments.local import LocalEnvironment, _run
+    from minisweagent.exceptions import LimitsExceeded
     from minisweagent.models.litellm_model import LitellmModel
     from minisweagent.models.utils.actions_toolcall import BASH_TOOL
 
     task = request["task"]
     condition = request["condition"]
-    prompt = task_prompt(task, condition)
+    task_prompt(task, condition)  # fail fast on an unknown condition
+    max_tokens = request.get("max_tokens", MODEL_MAX_TOKENS)
     step_limit = STEP_LIMITS[condition]
     temperature = request["temperature"]
     usage_log: list[dict[str, Any] | None] = []
+    # mini-swe-agent drops a reply without a tool call before it reaches the
+    # trajectory (it raises FormatError first), so keep those replies here.
+    replies_without_tool_calls: list[dict[str, Any]] = []
+
+    def _record_if_no_tool_call(raw: dict[str, Any], call_index: int) -> None:
+        choice = (raw.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        if message.get("tool_calls"):
+            return
+        replies_without_tool_calls.append({
+            "call": call_index,
+            "finish_reason": choice.get("finish_reason"),
+            "content": message.get("content"),
+            "reasoning_content": message.get("reasoning_content"),
+            "message_keys": sorted(message),
+        })
     started = time.monotonic()
 
     class GatewayModel(LitellmModel):
@@ -144,15 +267,36 @@ def run_task(request: dict[str, Any]) -> dict[str, Any]:
                     "tools": [BASH_TOOL],
                     "generation": {
                         "temperature": temperature,
-                        "max_tokens": MODEL_MAX_TOKENS,
+                        "max_tokens": max_tokens,
                     },
                 }
             )
+            if "gateway_error" in raw:
+                error = raw["gateway_error"]
+                if error.get("kind") == "context_exceeded":
+                    # The conversation no longer fits the model: end the run the
+                    # way the step and time limits do, keeping its files.
+                    raise LimitsExceeded({
+                        "role": "exit",
+                        "content": "ContextExceeded",
+                        "extra": {"exit_status": "ContextExceeded", "submission": ""},
+                    })
+                raise RuntimeError(f"gateway error: {error}")
             usage_log.append(raw.get("usage"))
+            _record_if_no_tool_call(raw, len(usage_log) - 1)
+            message = ((raw.get("choices") or [{}])[0]).get("message") or {}
+            command = recover_tool_call(message)
+            if command is not None:
+                message["tool_calls"] = [{
+                    "id": f"recovered_{len(usage_log) - 1}",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": json.dumps({"command": command})},
+                }]
+                replies_without_tool_calls[-1]["recovered_command"] = command
             return ModelResponse(**raw)
 
         def _calculate_cost(self, response):
-            return {"cost": 0.0}
+            return {"cost": 0.0}  # cost is computed offline from usage_log
 
     class CredentialScrubbedEnvironment(LocalEnvironment):
         """Keep infrastructure credentials out of model-written processes."""
@@ -165,6 +309,17 @@ def run_task(request: dict[str, Any]) -> dict[str, Any]:
             timeout: int | None = None,
         ):
             command = action.get("command", "")
+            if condition in NO_CODE_CONDITIONS and runs_code(command):
+                output = {
+                    "output": (
+                        "Not allowed: this task does not permit running, executing "
+                        "or testing code. Write reduce.py, then submit."
+                    ),
+                    "returncode": 1,
+                    "exception_info": "",
+                }
+                self._check_finished(output)
+                return output
             cwd = cwd or self.config.cwd or os.getcwd()
             child_env = {
                 key: value
@@ -198,6 +353,7 @@ def run_task(request: dict[str, Any]) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="reduction-") as raw_workspace:
         workspace = Path(raw_workspace)
+        prompt = task_prompt(task, condition, str(workspace))
         for name, content in request.get("input_files", {}).items():
             target = _within_workspace(workspace, name)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -212,6 +368,8 @@ def run_task(request: dict[str, Any]) -> dict[str, Any]:
             observation_template=baseline["model"]["observation_template"],
             format_error_template=baseline["model"]["format_error_template"],
         )
+        # Do not retry a call that ended the run (mini-swe-agent retries others).
+        model.abort_exceptions = [*model.abort_exceptions, LimitsExceeded]
         environment = CredentialScrubbedEnvironment(
             cwd=str(workspace),
             timeout=COMMAND_TIMEOUT_SECONDS,
@@ -235,13 +393,16 @@ def run_task(request: dict[str, Any]) -> dict[str, Any]:
             "model": request["model"],
             "condition": condition,
             "temperature": temperature,
+            "max_tokens": max_tokens,
             "step_limit": step_limit,
             "scaffold": f"mini-swe-agent=={MINI_SWE_AGENT_VERSION}",
             "prompt": prompt,
             "outcome": outcome,
+            "exit_status": (outcome or {}).get("exit_status"),
             "trajectory": agent.serialize(),
             "files": files,
             "agent_verified": _agent_verified(files["verdict.json"]),
             "usage": usage_log,
+            "replies_without_tool_calls": replies_without_tool_calls,
             "elapsed_seconds": time.monotonic() - started,
         }

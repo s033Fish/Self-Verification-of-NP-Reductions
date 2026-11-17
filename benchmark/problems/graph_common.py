@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from .base import (
     Instance,
     all_graphs,
+    external_sat,
     random_graph,
     require_int,
     require_keys,
@@ -168,31 +169,79 @@ def min_dominating_set_size(n: int, adj: list[int]) -> int:
 
 
 def three_colourable(n: int, adj: list[int]) -> bool:
-    """Exact 3-colouring by backtracking, colouring the most constrained
-    vertex first (most distinct neighbour colours, then highest degree)."""
-    colours = [-1] * n
+    """Exact 3-colouring. Uses the compiled SAT solver when available;
+    otherwise backtracking with constraint propagation:
+
+    Each vertex keeps a bitmask of the colours it may still take. Colouring a
+    vertex removes that colour from its neighbours, and a neighbour left with
+    one option is coloured at once (like unit propagation in SAT), which
+    settles gadget graphs from reductions without search. Branching picks the
+    vertex with the fewest options left, then the highest degree.
+    """
+    # One variable per (vertex, colour): exactly one colour per vertex, and
+    # no edge with both endpoints in the same colour. Vertex 0 gets colour 0
+    # (colours are interchangeable), which halves the search.
+    def var(v: int, c: int) -> int:
+        return 3 * v + c + 1
+
+    clauses = []
+    for v in range(n):
+        clauses.append([var(v, 0), var(v, 1), var(v, 2)])
+        clauses += [[-var(v, a), -var(v, b)] for a, b in ((0, 1), (0, 2), (1, 2))]
+        clauses += [[-var(v, c), -var(w, c)] for w in vertices(adj[v]) if w > v for c in range(3)]
+    if n:
+        clauses.append([var(0, 0)])
+    fast = external_sat(clauses)
+    if fast is not None:
+        return fast
+    return _three_colourable_search(n, adj)
+
+
+def _three_colourable_search(n: int, adj: list[int]) -> bool:
+    """Pure-Python fallback for three_colourable (see its docstring)."""
     neighbours = [list(vertices(adj[v])) for v in range(n)]
 
-    def solve(coloured: int) -> bool:
-        if coloured == n:
-            return True
-        chosen, chosen_key, chosen_used = -1, (-1, -1), set()
-        for v in range(n):
-            if colours[v] != -1:
+    def propagate(domains: list[int], colour: list[int], pending: list[tuple[int, int]]) -> bool:
+        while pending:
+            v, c = pending.pop()
+            if colour[v] != -1:
+                if colour[v] != c:
+                    return False
                 continue
-            used = {colours[w] for w in neighbours[v] if colours[w] != -1}
-            key = (len(used), len(neighbours[v]))
-            if key > chosen_key:
-                chosen, chosen_key, chosen_used = v, key, used
-        for colour in range(3):
-            if colour not in chosen_used:
-                colours[chosen] = colour
-                if solve(coloured + 1):
+            if not domains[v] >> c & 1:
+                return False
+            colour[v] = c
+            domains[v] = 1 << c
+            for w in neighbours[v]:
+                if colour[w] == c:
+                    return False
+                if colour[w] == -1 and domains[w] >> c & 1:
+                    domains[w] &= ~(1 << c)
+                    if not domains[w]:
+                        return False
+                    if not domains[w] & (domains[w] - 1):  # one colour left
+                        pending.append((w, domains[w].bit_length() - 1))
+        return True
+
+    def search(domains: list[int], colour: list[int]) -> bool:
+        chosen, chosen_key = -1, None
+        for v in range(n):
+            if colour[v] == -1:
+                key = (domains[v].bit_count(), -len(neighbours[v]))
+                if chosen_key is None or key < chosen_key:
+                    chosen, chosen_key = v, key
+        if chosen == -1:
+            return True
+        for c in range(3):
+            if domains[chosen] >> c & 1:
+                next_domains, next_colour = domains[:], colour[:]
+                if propagate(next_domains, next_colour, [(chosen, c)]) and search(
+                    next_domains, next_colour
+                ):
                     return True
-        colours[chosen] = -1
         return False
 
-    return solve(0)
+    return search([0b111] * n, [-1] * n)
 
 
 def hamiltonian_path_exists(n: int, adj: list[int]) -> bool:

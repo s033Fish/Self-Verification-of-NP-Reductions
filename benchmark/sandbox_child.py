@@ -27,7 +27,10 @@ import time
 
 # Solver helpers in the bundled problems.py; each class's is_yes is stubbed too.
 SOLVER_FUNCTIONS = (
+    "external_sat",
     "_satisfiable",
+    "_dpll",
+    "_three_colourable_search",
     "satisfiable",
     "max_independent_set_size",
     "min_dominating_set_size",

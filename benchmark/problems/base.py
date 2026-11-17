@@ -127,6 +127,26 @@ class Problem(ABC):
         """Every valid instance with scale at most `scale`, each exactly once."""
 
 
+# --- Optional fast SAT solver -------------------------------------------------
+
+
+def external_sat(clauses) -> bool | None:
+    """Solve a CNF with the compiled CaDiCaL solver from python-sat, if that
+    package is installed; return None if it is not, so callers fall back to
+    their pure-Python search. The verifier has python-sat; an agent's sandbox
+    does not, and needs neither: both paths give the same exact answer.
+    """
+    try:
+        from pysat.solvers import Solver
+    except ImportError:
+        return None
+    clause_lists = [list(clause) for clause in clauses]
+    if any(not clause for clause in clause_lists):
+        return False
+    with Solver(name="cadical153", bootstrap_with=clause_lists) as solver:
+        return bool(solver.solve())
+
+
 # --- Shared validation helpers ---------------------------------------------
 
 

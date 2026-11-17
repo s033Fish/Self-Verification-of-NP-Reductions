@@ -85,3 +85,15 @@ def test_malformed_instances_are_rejected(instance):
 
 def test_size():
     assert ThreeSat.size({"num_vars": 4, "clauses": [[1, 2, 3], [-2, 3, 4]]}) == 10
+
+
+def test_pure_python_fallback_matches_brute_force():
+    """Agents' sandboxes lack python-sat, so problems.py falls back to DPLL."""
+    from benchmark.problems.three_sat import _dpll
+
+    rng = random.Random(1)
+    for instance in list(ThreeSat.enumerate_instances(3)) + [
+        ThreeSat.random_instance(rng, rng.randint(3, 8)) for _ in range(300)
+    ]:
+        clauses = [frozenset(c) for c in instance["clauses"]]
+        assert _dpll(clauses) == brute_force(instance)

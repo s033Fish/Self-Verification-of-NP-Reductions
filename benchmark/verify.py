@@ -6,11 +6,21 @@ A reduction from SOURCE to TARGET is correct only if it passes every check:
                output is a valid TARGET instance and
                SOURCE.is_yes(x) == TARGET.is_yes(reduce(x)).
 2. Random      The same check on random instances one and two scales larger.
+               Half are perturbed first: edges, clauses, literals, sets and
+               numbers are shuffled and edges reversed. Every spec says order
+               and orientation do not matter, so a reduction that relies on
+               the generators' sorted output fails here.
 3. Scaling     reduce runs on random instances over a range of sizes, without
                solving them. Output size must stay polynomial: the fitted
-               exponent of output size against input size is at most 4, and
-               every output is at most 50 * (input size)^4. Time is fitted
-               and reported too.
+               exponent of output size against input size is at most 4, over
+               the whole range AND between the two largest scales (where
+               exponential growth shows clearly), and every output is at most
+               50 * (input size)^4. Time is fitted and reported too.
+
+Throughout, each reduce call has a time limit, reduce.py runs in a separate
+`python -I` process (sandbox_child.py) with the task's brute-force solvers
+replaced by stubs, and the correct answers come from the trusted problem
+library outside the sandbox.
 
 Verdicts:
   correct       every check passed
@@ -51,7 +61,7 @@ from typing import Any, Iterator
 from benchmark.problems import PROBLEMS, Problem
 from benchmark.problems.base import canonical
 
-VERIFIER_VERSION = "1.0"
+VERIFIER_VERSION = "1.4"
 REPO = Path(__file__).resolve().parents[1]
 CHILD = Path(__file__).resolve().parent / "sandbox_child.py"
 MAX_STORED_CHARS = 4000  # target instances longer than this are truncated in verdicts
@@ -71,6 +81,10 @@ class Settings:
     scaling_points: int = 5            # distinct source scales in the scaling phase
     scaling_draws: int = 5             # instances per scale
     max_size_exponent: float = 4.0
+    # Distinct scaling inputs at or above which the outputs must not collapse
+    # to one or two fixed instances (a decider, not a reduction).
+    min_inputs_for_constant_check: int = 10
+    max_constant_outputs: int = 2
     size_constant: float = 50.0
     memory_mb: int = 2048
 
@@ -217,6 +231,28 @@ class Verdict:
         return data
 
 
+def perturb(instance: Any, rng: random.Random) -> Any:
+    """The same instance with every order-free list shuffled and every edge
+    randomly reversed. Valid for all 15 problems: their specs say edge, clause,
+    literal, set, element and number order do not matter."""
+    result = dict(instance)
+    if "edges" in result:
+        edges = [list(e) if rng.random() < 0.5 else [e[1], e[0]] for e in result["edges"]]
+        rng.shuffle(edges)
+        result["edges"] = edges
+    if "clauses" in result:
+        clauses = [rng.sample(clause, len(clause)) for clause in result["clauses"]]
+        rng.shuffle(clauses)
+        result["clauses"] = clauses
+    if "sets" in result:
+        sets = [rng.sample(subset, len(subset)) for subset in result["sets"]]
+        rng.shuffle(sets)
+        result["sets"] = sets
+    if "numbers" in result:
+        result["numbers"] = rng.sample(result["numbers"], len(result["numbers"]))
+    return result
+
+
 # --- Checks -----------------------------------------------------------------------
 
 
@@ -248,6 +284,13 @@ def _check_pair(verdict: Verdict, phase: str, source: type[Problem], target: typ
     return True
 
 
+def _fingerprint(value: Any) -> str:
+    try:
+        return canonical(value) if isinstance(value, dict) else json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
 def _fit_exponent(points: list[tuple[float, float]]) -> float | None:
     """Least-squares slope of log(y) against log(x)."""
     usable = [(math.log(x), math.log(y)) for x, y in points if x > 1 and y > 0]
@@ -257,6 +300,24 @@ def _fit_exponent(points: list[tuple[float, float]]) -> float | None:
     mean_y = sum(py for _, py in usable) / len(usable)
     spread = sum((px - mean_x) ** 2 for px, _ in usable)
     return sum((px - mean_x) * (py - mean_y) for px, py in usable) / spread
+
+
+def _tail_exponent(per_scale: dict[int, list[tuple[float, float]]]) -> float | None:
+    """Growth exponent between the median points of the two largest scales.
+    A fit over the whole range can hide exponential growth behind the small
+    scales; between the largest two it cannot."""
+    if len(per_scale) < 2:
+        return None
+
+    def median_point(points: list[tuple[float, float]]) -> tuple[float, float]:
+        ins = sorted(p[0] for p in points)
+        outs = sorted(p[1] for p in points)
+        return ins[len(ins) // 2], outs[len(outs) // 2]
+
+    (x1, y1), (x2, y2) = (median_point(per_scale[s]) for s in sorted(per_scale)[-2:])
+    if x1 <= 1 or x2 <= x1 * 1.05 or y1 <= 0 or y2 <= 0:
+        return None  # inputs too similar to measure a slope
+    return math.log(y2 / y1) / math.log(x2 / x1)
 
 
 def scaling_scales(source: type[Problem], points: int) -> list[int]:
@@ -326,6 +387,8 @@ def _run_phases(verdict: Verdict, sandbox: Sandbox, source: type[Problem],
             if time.monotonic() > deadline or random_failures >= settings.max_random_failures:
                 break
             x = source.random_instance(rng, source.exhaustive_scale + extra)
+            if rng.random() < 0.5:
+                x = perturb(x, rng)
             outcome = _check_pair(verdict, "random", source, target, x, sandbox.call(x), settings)
             if outcome is None:
                 verdict.checked["random_unchecked"] += 1
@@ -343,6 +406,9 @@ def _run_phases(verdict: Verdict, sandbox: Sandbox, source: type[Problem],
     rng = random.Random(f"{seed}:scaling")
     size_points: list[tuple[float, float]] = []
     time_points: list[tuple[float, float]] = []
+    per_scale: dict[int, list[tuple[float, float]]] = {}
+    distinct_inputs: set[str] = set()
+    distinct_outputs: set[str] = set()
     for scale in scaling_scales(source, settings.scaling_points):
         for _ in range(settings.scaling_draws):
             x = source.random_instance(rng, scale)
@@ -357,8 +423,11 @@ def _run_phases(verdict: Verdict, sandbox: Sandbox, source: type[Problem],
                 verdict.fail("malformed_output", "scaling", source, x, error=str(error)[:500], output=y)
                 return
             n_in, n_out = source.size(x), target.size(y)
+            distinct_inputs.add(_fingerprint(x))
+            distinct_outputs.add(_fingerprint(y))
             verdict.checked["scaling"] += 1
             size_points.append((n_in, max(n_out, 1)))
+            per_scale.setdefault(scale, []).append((n_in, max(n_out, 1)))
             if reply["seconds"] >= 1e-4:
                 time_points.append((n_in, reply["seconds"]))
             if n_out > settings.size_constant * max(n_in, 1) ** settings.max_size_exponent:
@@ -367,12 +436,31 @@ def _run_phases(verdict: Verdict, sandbox: Sandbox, source: type[Problem],
                 return
 
     size_exponent = _fit_exponent(size_points)
+    tail_exponent = _tail_exponent(per_scale)
     verdict.scaling = {
         "size_exponent": None if size_exponent is None else round(size_exponent, 3),
+        "tail_exponent": None if tail_exponent is None else round(tail_exponent, 3),
         "time_exponent": (lambda e: None if e is None else round(e, 3))(_fit_exponent(time_points)),
         "max_input_size": max((p[0] for p in size_points), default=0),
         "max_output_size": max((p[1] for p in size_points), default=0),
+        "distinct_inputs": len(distinct_inputs),
+        "distinct_outputs": len(distinct_outputs),
     }
+    if (len(distinct_inputs) >= settings.min_inputs_for_constant_check
+            and len(distinct_outputs) <= settings.max_constant_outputs):
+        # Every large input went to one of at most two fixed instances: the
+        # reduction decides the source instance itself and emits a canned
+        # yes/no answer. Right answers, but no polynomial-time reduction does
+        # this for an NP-hard source unless P = NP.
+        verdict.fail("constant_output", "scaling", source, None,
+                     error=f"{len(distinct_inputs)} distinct inputs mapped to only "
+                           f"{len(distinct_outputs)} distinct output instance(s)")
+        return
+    if tail_exponent is not None and tail_exponent > settings.max_size_exponent:
+        verdict.fail("blowup", "scaling", source, None,
+                     error=f"between the two largest scales, output size grows like "
+                           f"input^{tail_exponent:.2f}")
+        return
     if size_exponent is not None and size_exponent > settings.max_size_exponent:
         worst = max(size_points, key=lambda p: p[1])
         verdict.fail("blowup", "scaling", source, None,
