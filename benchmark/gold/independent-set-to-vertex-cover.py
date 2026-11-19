@@ -1,4 +1,4 @@
-"""Gold reduction: Independent Set -> Vertex Cover.
+r"""Gold reduction: Independent Set -> Vertex Cover.
 
 S is an independent set of G exactly when V \ S is a vertex cover of G, so
 G has an independent set of at least k vertices iff it has a vertex cover of

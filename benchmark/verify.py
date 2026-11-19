@@ -5,7 +5,8 @@ A reduction from SOURCE to TARGET is correct only if it passes every check:
 1. Exhaustive  For every source instance up to SOURCE.exhaustive_scale, the
                output is a valid TARGET instance and
                SOURCE.is_yes(x) == TARGET.is_yes(reduce(x)).
-2. Random      The same check on random instances one and two scales larger.
+2. Random      The same check on random instances one, two and three scales
+               larger (100 per scale).
                Half are perturbed first: edges, clauses, literals, sets and
                numbers are shuffled and edges reversed. Every spec says order
                and orientation do not matter, so a reduction that relies on
@@ -16,6 +17,14 @@ A reduction from SOURCE to TARGET is correct only if it passes every check:
                the whole range AND between the two largest scales (where
                exponential growth shows clearly), and every output is at most
                50 * (input size)^4. Time is fitted and reported too.
+
+4. Stress      reduce runs on instances 1.5x and 2x the largest scaling
+               scale. Each call may take at most 10 x (the slowest call at the
+               largest scaling scale) x (input size ratio)^4, and never less
+               than 5 s. Slower means the running time grows faster than any
+               allowed polynomial: a reduction that enumerates assignments
+               takes milliseconds at 15 variables and never finishes at 30. When the
+               allowance exceeds a 10 s cap, a timeout is left unchecked.
 
 Throughout, each reduce call has a time limit, reduce.py runs in a separate
 `python -I` process (sandbox_child.py) with the task's brute-force solvers
@@ -31,11 +40,19 @@ Verdicts:
                 Never counted as correct.
 
 Failure categories: no_reduce_file, crash, solver_call, timeout,
-malformed_output, wrong_answer_yes_to_no, wrong_answer_no_to_yes, blowup.
+malformed_output, wrong_answer_yes_to_no, wrong_answer_no_to_yes, blowup,
+constant_output (every large input maps to one of at most two fixed
+instances: the reduction decides the source instance itself),
+superpolynomial_time (the stress phase).
 
     uv run python -m benchmark.verify                       # every run in runs/
     uv run python -m benchmark.verify --run RUN_ID          # selected runs
     uv run python -m benchmark.verify --reduce gold.py --task TASK_ID
+
+The c4 oracle (infrastructure/agent_runner.py) runs the same checks during a
+run through --oracle-request, with its own seed and a shorter random phase:
+
+    python -m benchmark.verify --oracle-request request.json
 """
 
 from __future__ import annotations
@@ -61,7 +78,7 @@ from typing import Any, Iterator
 from benchmark.problems import PROBLEMS, Problem
 from benchmark.problems.base import canonical
 
-VERIFIER_VERSION = "1.4"
+VERIFIER_VERSION = "1.10"  # 1.10: stress floor 5 s (was 1 s)
 REPO = Path(__file__).resolve().parents[1]
 CHILD = Path(__file__).resolve().parent / "sandbox_child.py"
 MAX_STORED_CHARS = 4000  # target instances longer than this are truncated in verdicts
@@ -73,8 +90,12 @@ class Settings:
     call_timeout: float = 2.0          # seconds per reduce call
     startup_timeout: float = 15.0      # seconds to import reduce.py
     solver_timeout: float = 5.0        # seconds for the library to solve one instance pair
-    random_extra_scales: tuple[int, ...] = (1, 2)
-    random_per_scale: int = 50
+    # 1.6: three scales of 100 (was two of 50). A SAT -> 3-SAT reduction that
+    # shares chain variables between long clauses fails on only ~3% of random
+    # 4-5 variable formulas; two scales of 50 caught it on 16 of 20 seeds,
+    # three scales of 100 on 20 of 20.
+    random_extra_scales: tuple[int, ...] = (1, 2, 3)
+    random_per_scale: int = 100
     min_random_checked: int = 50       # fewer checked random instances -> inconclusive
     max_random_failures: int = 5
     random_phase_seconds: float = 120.0
@@ -83,6 +104,15 @@ class Settings:
     max_size_exponent: float = 4.0
     # Distinct scaling inputs at or above which the outputs must not collapse
     # to one or two fixed instances (a decider, not a reduction).
+    stress_factors: tuple[float, ...] = (1.5, 2.0)  # x the largest scaling scale
+    stress_draws: int = 3
+    stress_slack: float = 10.0          # x the polynomial extrapolation
+    # Never fail a call faster than this. 1.10: was 1 s, which failed a correct
+    # O(n^2 k^2) Clique -> SAT encoding (1.6 s on sparse 40-vertex graphs, whose
+    # input size equals a dense 20-vertex graph's). Exponential reductions do
+    # not finish in 20 s at 2x scale, so 5 s still separates them.
+    stress_floor_seconds: float = 5.0
+    stress_cap_seconds: float = 10.0    # longest a stress call is allowed to run
     min_inputs_for_constant_check: int = 10
     max_constant_outputs: int = 2
     size_constant: float = 50.0
@@ -166,7 +196,7 @@ class Sandbox:
             return {"ready": False, "kind": "timeout", "error": "importing reduce.py timed out"}
         return message
 
-    def call(self, instance: Any) -> dict[str, Any]:
+    def call(self, instance: Any, timeout: float | None = None) -> dict[str, Any]:
         assert self.process.stdin is not None
         try:
             self.process.stdin.write(json.dumps({"instance": instance}) + "\n")
@@ -174,11 +204,12 @@ class Sandbox:
         except BrokenPipeError:
             self.dead = True
             return {"ok": False, "kind": "crash", "error": "sandbox process exited"}
-        reply = self._receive(self.settings.call_timeout)
+        limit = self.settings.call_timeout if timeout is None else timeout
+        reply = self._receive(limit)
         if reply is None:
             self.close()
             return {"ok": False, "kind": "timeout",
-                    "error": f"reduce took longer than {self.settings.call_timeout} s"}
+                    "error": f"reduce took longer than {limit:.3g} s"}
         return reply
 
     def close(self) -> None:
@@ -200,6 +231,7 @@ class Verdict:
     checked: dict[str, int] = field(default_factory=lambda: {
         "exhaustive": 0, "exhaustive_unchecked": 0,
         "random": 0, "random_unchecked": 0, "scaling": 0,
+        "stress": 0, "stress_unchecked": 0,
     })
     scaling: dict[str, Any] | None = None
     verifier_version: str = VERIFIER_VERSION
@@ -303,18 +335,20 @@ def _fit_exponent(points: list[tuple[float, float]]) -> float | None:
 
 
 def _tail_exponent(per_scale: dict[int, list[tuple[float, float]]]) -> float | None:
-    """Growth exponent between the median points of the two largest scales.
-    A fit over the whole range can hide exponential growth behind the small
-    scales; between the largest two it cannot."""
+    """Growth exponent between the two largest scales, comparing the largest
+    input and the largest output at each. A fit over the whole range can hide
+    exponential growth behind the small scales; between the largest two it
+    cannot. Largest rather than median (1.7): random instances now include
+    trivial cases (k < 0, a target above the total) that a correct reduction
+    may map to a tiny fixed instance, and a median landing on one of those
+    made polynomial growth look like input^18."""
     if len(per_scale) < 2:
         return None
 
-    def median_point(points: list[tuple[float, float]]) -> tuple[float, float]:
-        ins = sorted(p[0] for p in points)
-        outs = sorted(p[1] for p in points)
-        return ins[len(ins) // 2], outs[len(outs) // 2]
+    def envelope(points: list[tuple[float, float]]) -> tuple[float, float]:
+        return max(p[0] for p in points), max(p[1] for p in points)
 
-    (x1, y1), (x2, y2) = (median_point(per_scale[s]) for s in sorted(per_scale)[-2:])
+    (x1, y1), (x2, y2) = (envelope(per_scale[s]) for s in sorted(per_scale)[-2:])
     if x1 <= 1 or x2 <= x1 * 1.05 or y1 <= 0 or y2 <= 0:
         return None  # inputs too similar to measure a slope
     return math.log(y2 / y1) / math.log(x2 / x1)
@@ -409,7 +443,9 @@ def _run_phases(verdict: Verdict, sandbox: Sandbox, source: type[Problem],
     per_scale: dict[int, list[tuple[float, float]]] = {}
     distinct_inputs: set[str] = set()
     distinct_outputs: set[str] = set()
-    for scale in scaling_scales(source, settings.scaling_points):
+    scales = scaling_scales(source, settings.scaling_points)
+    reference_seconds, reference_size = 0.0, 1
+    for scale in scales:
         for _ in range(settings.scaling_draws):
             x = source.random_instance(rng, scale)
             reply = sandbox.call(x)
@@ -430,12 +466,25 @@ def _run_phases(verdict: Verdict, sandbox: Sandbox, source: type[Problem],
             per_scale.setdefault(scale, []).append((n_in, max(n_out, 1)))
             if reply["seconds"] >= 1e-4:
                 time_points.append((n_in, reply["seconds"]))
+            if scale == scales[-1]:
+                # The slowest call and the largest input at the top scale: the
+                # most generous time for the smallest size ratio.
+                reference_seconds = max(reference_seconds, reply["seconds"])
+                reference_size = max(reference_size, n_in)
             if n_out > settings.size_constant * max(n_in, 1) ** settings.max_size_exponent:
                 verdict.fail("blowup", "scaling", source, x,
                              error=f"output size {n_out} for input size {n_in}")
                 return
 
-    size_exponent = _fit_exponent(size_points)
+    # 1.9: fit through the largest input and output at each scale, not every
+    # point. Random instances include trivial cases (k < 0, a target above
+    # the total) that a correct reduction maps to a tiny fixed instance; mixed
+    # into a fit over all points they made a correct Subset Sum -> SAT adder
+    # look like input^4.33 (its growth between the top scales was input^1.01).
+    size_exponent = _fit_exponent([
+        (max(p[0] for p in points), max(p[1] for p in points))
+        for points in per_scale.values() if points
+    ])
     tail_exponent = _tail_exponent(per_scale)
     verdict.scaling = {
         "size_exponent": None if size_exponent is None else round(size_exponent, 3),
@@ -466,6 +515,77 @@ def _run_phases(verdict: Verdict, sandbox: Sandbox, source: type[Problem],
         verdict.fail("blowup", "scaling", source, None,
                      error=f"output size grows like input^{size_exponent:.2f} "
                            f"(largest: {worst[1]} for input size {worst[0]})")
+        return
+
+    _stress(verdict, sandbox, source, target, settings, seed, scales[-1],
+            reference_seconds, reference_size)
+
+
+def stress_allowance(settings: Settings, reference_seconds: float,
+                     reference_size: int, size: int) -> float:
+    """Longest a call on an input of this size may take before its running time
+    counts as growing faster than (input size)^max_size_exponent."""
+    ratio = max(size, 1) / max(reference_size, 1)
+    extrapolated = reference_seconds * max(ratio, 1.0) ** settings.max_size_exponent
+    return max(settings.stress_floor_seconds, settings.stress_slack * extrapolated)
+
+
+def _stress(verdict: Verdict, sandbox: Sandbox, source: type[Problem], target: type[Problem],
+            settings: Settings, seed: str, top_scale: int,
+            reference_seconds: float, reference_size: int) -> None:
+    """4. Stress: running time on instances beyond the scaling range."""
+    rng = random.Random(f"{seed}:stress")
+    points: list[dict[str, Any]] = []
+    if verdict.scaling is not None:
+        verdict.scaling["stress"] = {
+            "reference_seconds": round(reference_seconds, 4),
+            "reference_size": reference_size,
+            "points": points,
+        }
+    for factor in settings.stress_factors:
+        scale = max(top_scale + 1, round(top_scale * factor))
+        # Smallest first: a timeout ends the sandbox, and the smallest input
+        # gives the tightest allowance, so it is the most decisive check.
+        draws = sorted((source.random_instance(rng, scale) for _ in range(settings.stress_draws)),
+                       key=source.size)
+        for x in draws:
+            if sandbox.dead:
+                return
+            n_in = source.size(x)
+            allowed = stress_allowance(settings, reference_seconds, reference_size, n_in)
+            limit = min(allowed, settings.stress_cap_seconds)
+            reply = sandbox.call(x, timeout=limit)
+            if not reply.get("ok"):
+                if reply.get("kind") == "timeout" and allowed > settings.stress_cap_seconds:
+                    verdict.checked["stress_unchecked"] += 1  # too slow to tell within the cap
+                    points.append({"size": n_in, "seconds": None, "allowed": round(allowed, 3)})
+                    return
+                if reply.get("kind") == "timeout":
+                    verdict.fail(
+                        "superpolynomial_time", "stress", source, x,
+                        error=(f"reduce took over {limit:.2f} s on input size {n_in}; at input "
+                               f"size {reference_size} it took {reference_seconds:.3f} s, so "
+                               f"polynomial growth (degree {settings.max_size_exponent:g}) "
+                               f"allows at most {allowed:.2f} s"),
+                    )
+                else:
+                    verdict.fail(reply["kind"], "stress", source, x, error=reply.get("error"))
+                return
+            verdict.checked["stress"] += 1
+            points.append({"size": n_in, "seconds": round(reply["seconds"], 4),
+                           "allowed": round(allowed, 3)})
+            y = reply["output"]
+            try:
+                target.validate(y)
+            except Exception as error:
+                verdict.fail("malformed_output", "stress", source, x, error=str(error)[:500], output=y)
+                return
+            n_out = target.size(y)
+            if n_out > settings.size_constant * max(n_in, 1) ** settings.max_size_exponent:
+                verdict.fail("blowup", "stress", source, x,
+                             error=f"output size {n_out} for input size {n_in}")
+                return
+
 
 
 # --- Runs, tasks and the CLI -------------------------------------------------------
@@ -502,6 +622,30 @@ def _write_atomically(path: Path, data: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+# Oracle checks during a c4 run: the full checks, a shorter random phase.
+ORACLE_SETTINGS = Settings(random_phase_seconds=60.0)
+
+
+def oracle_check(request: dict[str, Any]) -> dict[str, Any]:
+    """Verify one reduce.py for the c4 oracle.
+
+    request: {"reduce_file", "problems_file", "source", "target", "seed"}, with
+    source and target given as problem names (e.g. "3-SAT"). The seed differs
+    from the final verdict's, so feedback never reveals the graded random
+    instances (the exhaustive phase is the same: it covers every small
+    instance, so fixing those failures is fair).
+    """
+    verdict = verify_reduction(
+        Path(request["reduce_file"]),
+        Path(request["problems_file"]),
+        problem_by_name(request["source"]),
+        problem_by_name(request["target"]),
+        ORACLE_SETTINGS,
+        seed=request["seed"],
+    )
+    return verdict.to_json()
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -514,7 +658,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     parser.add_argument("--reduce", type=Path, help="verify one reduce.py (with --task)")
     parser.add_argument("--task", help="task ID for --reduce")
+    parser.add_argument("--oracle-request", type=Path, help="c4 oracle: a JSON request file")
     arguments = parser.parse_args(argv)
+
+    if arguments.oracle_request:
+        result = oracle_check(json.loads(arguments.oracle_request.read_text()))
+        print(json.dumps(result))  # one line, read by the runner
+        return
 
     if arguments.reduce:
         if not arguments.task:

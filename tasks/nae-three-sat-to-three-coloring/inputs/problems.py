@@ -118,6 +118,21 @@ def external_sat(clauses) -> bool | None:
         return bool(solver.solve())
 
 
+def fast_decide(name: str, *args):
+    """A fast exact answer from benchmark/problems/fast_paths.py, or None.
+
+    That module is never bundled into a task's problems.py (its CNF
+    encodings would hand agents reductions they are asked to write), so in
+    an agent's sandbox the import fails and callers use their pure-Python
+    search instead. Both paths give the same exact answer.
+    """
+    try:
+        from benchmark.problems.fast_paths import DECIDERS
+    except ImportError:
+        return None
+    return DECIDERS[name](*args)
+
+
 # --- Shared validation helpers ---------------------------------------------
 
 
@@ -496,11 +511,12 @@ def enumerate_graphs(scale: int) -> Iterator[Instance]:
 
 
 def enumerate_graphs_with_k(scale: int) -> Iterator[Instance]:
-    """Every graph on 0..scale vertices, with every k from 0 to n. Other k
-    values are valid but answered by the edge-case rules alone."""
+    """Every graph on 0..scale vertices, with every k from -1 to n + 1. The
+    problem answers k < 0 and k > n by its edge-case rules, but a reduction
+    still has to map them correctly, so one value beyond each end is included."""
     for n in range(scale + 1):
         for edges in all_graphs(n):
-            for k in range(n + 1):
+            for k in range(-1, n + 2):
                 yield {"n": n, "edges": edges, "k": k}
 
 
@@ -508,8 +524,19 @@ def random_plain_graph(rng: random.Random, scale: int) -> Instance:
     return {"n": scale, "edges": random_graph(rng, scale)}
 
 
+def random_k(rng: random.Random, high: int) -> int:
+    """Mostly 0..high; 1 in 10 below 0 and 1 in 10 above high, since the
+    specs allow any integer k and reductions must handle those too."""
+    roll = rng.random()
+    if roll < 0.1:
+        return -rng.randint(1, high + 2)
+    if roll < 0.2:
+        return high + rng.randint(1, high + 2)
+    return rng.randint(0, high)
+
+
 def random_graph_with_k(rng: random.Random, scale: int) -> Instance:
-    return {"n": scale, "edges": random_graph(rng, scale), "k": rng.randint(0, scale)}
+    return {"n": scale, "edges": random_graph(rng, scale), "k": random_k(rng, scale)}
 
 
 # --- Bitmask utilities --------------------------------------------------------
@@ -613,8 +640,8 @@ def min_dominating_set_size(n: int, adj: list[int]) -> int:
 
 
 def three_colourable(n: int, adj: list[int]) -> bool:
-    """Exact 3-colouring. Uses the compiled SAT solver when available;
-    otherwise backtracking with constraint propagation:
+    """Exact 3-colouring. Uses the verifier's fast path when available
+    (base.fast_decide); otherwise backtracking with constraint propagation:
 
     Each vertex keeps a bitmask of the colours it may still take. Colouring a
     vertex removes that colour from its neighbours, and a neighbour left with
@@ -622,20 +649,7 @@ def three_colourable(n: int, adj: list[int]) -> bool:
     settles gadget graphs from reductions without search. Branching picks the
     vertex with the fewest options left, then the highest degree.
     """
-    # One variable per (vertex, colour): exactly one colour per vertex, and
-    # no edge with both endpoints in the same colour. Vertex 0 gets colour 0
-    # (colours are interchangeable), which halves the search.
-    def var(v: int, c: int) -> int:
-        return 3 * v + c + 1
-
-    clauses = []
-    for v in range(n):
-        clauses.append([var(v, 0), var(v, 1), var(v, 2)])
-        clauses += [[-var(v, a), -var(v, b)] for a, b in ((0, 1), (0, 2), (1, 2))]
-        clauses += [[-var(v, c), -var(w, c)] for w in vertices(adj[v]) if w > v for c in range(3)]
-    if n:
-        clauses.append([var(0, 0)])
-    fast = external_sat(clauses)
+    fast = fast_decide("three_colourable", n, [list(vertices(adj[v])) for v in range(n)])
     if fast is not None:
         return fast
     return _three_colourable_search(n, adj)

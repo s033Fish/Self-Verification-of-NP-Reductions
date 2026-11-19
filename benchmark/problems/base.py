@@ -147,6 +147,21 @@ def external_sat(clauses) -> bool | None:
         return bool(solver.solve())
 
 
+def fast_decide(name: str, *args):
+    """A fast exact answer from benchmark/problems/fast_paths.py, or None.
+
+    That module is never bundled into a task's problems.py (its CNF
+    encodings would hand agents reductions they are asked to write), so in
+    an agent's sandbox the import fails and callers use their pure-Python
+    search instead. Both paths give the same exact answer.
+    """
+    try:
+        from benchmark.problems.fast_paths import DECIDERS
+    except ImportError:
+        return None
+    return DECIDERS[name](*args)
+
+
 # --- Shared validation helpers ---------------------------------------------
 
 

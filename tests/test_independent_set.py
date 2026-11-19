@@ -14,7 +14,7 @@ TRIANGLE = [[0, 1], [1, 2], [0, 2]]
 
 def test_interface():
     counts = check_problem(IndependentSet)
-    assert counts["enumerated"] == 6505  # graphs on 0..5 vertices, k = 0..n
+    assert counts["enumerated"] == 8705  # graphs on 0..5 vertices, k = -1..n+1
 
 
 @pytest.mark.parametrize(

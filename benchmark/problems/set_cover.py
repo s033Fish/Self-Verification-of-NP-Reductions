@@ -6,6 +6,7 @@ import random
 from collections.abc import Iterator
 
 from .base import Instance, Problem, require_int
+from .graph_common import random_k
 from .sets_common import (
     enumerate_set_systems,
     masks,
@@ -59,12 +60,12 @@ class SetCover(Problem):
     def random_instance(cls, rng: random.Random, scale: int) -> Instance:
         """scale = universe size."""
         sets = random_sets(rng, scale, max_sets=2 * scale + 1)
-        return {"universe_size": scale, "sets": sets, "k": rng.randint(0, len(sets))}
+        return {"universe_size": scale, "sets": sets, "k": random_k(rng, len(sets))}
 
     @classmethod
     def enumerate_instances(cls, scale: int) -> Iterator[Instance]:
         for universe_size, sets in enumerate_set_systems(scale):
-            for k in range(len(sets) + 1):
+            for k in range(-1, len(sets) + 2):  # one value beyond each end
                 yield {"universe_size": universe_size, "sets": sets, "k": k}
 
 

@@ -14,7 +14,14 @@ import pytest
 
 from benchmark.make_task import Pair, write_task
 from benchmark.problems import PROBLEMS
-from benchmark.verify import Settings, _fit_exponent, perturb, verify_reduction, verify_run
+from benchmark.verify import (
+    Settings,
+    _fit_exponent,
+    perturb,
+    stress_allowance,
+    verify_reduction,
+    verify_run,
+)
 
 # Smaller than the defaults so the suite stays quick; same checks.
 FAST = Settings(
@@ -28,6 +35,7 @@ FAST = Settings(
 INDSET_TO_VC = Pair("independent_set", "vertex_cover", famous=True, split="dev")
 SUBSET_SUM_TO_PARTITION = Pair("subset_sum", "partition", famous=True, split="dev")
 THREE_SAT_TO_EXACT_COVER = Pair("three_sat", "exact_cover", famous=False, split="dev")
+CLIQUE_TO_SAT = Pair("clique", "sat", famous=False, split="test")
 
 # --- Correct reductions -------------------------------------------------------
 
@@ -157,6 +165,7 @@ def tasks(tmp_path_factory) -> Path:
     write_task(INDSET_TO_VC, root)
     write_task(SUBSET_SUM_TO_PARTITION, root)
     write_task(THREE_SAT_TO_EXACT_COVER, root)
+    write_task(CLIQUE_TO_SAT, root)
     return root
 
 
@@ -181,7 +190,7 @@ def run(tasks: Path, tmp_path: Path, code: str, pair: Pair = INDSET_TO_VC):
 def test_correct_reductions_pass(tasks, tmp_path, code):
     verdict = run(tasks, tmp_path, code)
     assert verdict.status == "correct", verdict.counterexample
-    assert verdict.checked["exhaustive"] == 6505
+    assert verdict.checked["exhaustive"] == 8705
     assert verdict.checked["random"] >= FAST.min_random_checked
     assert verdict.scaling and verdict.scaling["size_exponent"] <= 4
 
@@ -233,10 +242,9 @@ def test_identity_fails_with_a_small_counterexample(tasks, tmp_path):
     assert verdict.category.startswith("wrong_answer")
     example = verdict.counterexample
     assert example["phase"] == "exhaustive"
-    # The smallest failing instances are a single edge: e.g. k = 0 is a yes
-    # for Independent Set but a no for Vertex Cover (the edge needs covering).
-    assert example["source_instance"]["n"] == 2
-    assert example["source_instance"]["edges"] == [[0, 1]]
+    # The smallest failing instance is the empty graph with k = -1: always
+    # yes for Independent Set (k <= 0) but always no for Vertex Cover (k < 0).
+    assert example["source_instance"] == {"n": 0, "edges": [], "k": -1}
     assert example["expected"] != example["got"]
 
 
@@ -334,3 +342,74 @@ def test_decider_with_constant_output_is_caught(tasks, tmp_path):
 def test_correct_reductions_have_many_distinct_outputs(tasks, tmp_path):
     verdict = run(tasks, tmp_path, GOLD_INDSET_TO_VC)
     assert verdict.scaling["distinct_outputs"] == verdict.scaling["distinct_inputs"]
+
+
+# Two false negatives found by the cross-model tester (GPT-OSS writers, c5): one
+# Exact Cover set per satisfying assignment. Few formulas at the scaling sizes
+# have many satisfying assignments, so the output stays small, and 2^15
+# assignments still run in milliseconds; the outputs vary, so constant_output
+# does not apply. At 22 variables a call takes seconds.
+SET_PER_SATISFYING_ASSIGNMENT = """
+def reduce(instance):
+    m, clauses = instance["num_vars"], instance["clauses"]
+    c = len(clauses)
+    if c == 0:
+        return {"universe_size": 0, "sets": []}
+    def satisfied(a):
+        return all(any(((a >> (abs(l) - 1)) & 1) == (l > 0) for l in cl) for cl in clauses)
+    return {"universe_size": c, "sets": [list(range(c)) for a in range(1 << m) if satisfied(a)]}
+"""
+
+
+def test_superpolynomial_running_time_is_caught(tasks, tmp_path):
+    verdict = run(tasks, tmp_path, SET_PER_SATISFYING_ASSIGNMENT, THREE_SAT_TO_EXACT_COVER)
+    assert verdict.status == "wrong"
+    assert verdict.category == "superpolynomial_time", verdict.counterexample
+    assert verdict.counterexample["phase"] == "stress"
+
+
+def test_stress_phase_passes_correct_reductions(tasks, tmp_path):
+    verdict = run(tasks, tmp_path, GOLD_INDSET_TO_VC)
+    assert verdict.status == "correct"
+    assert verdict.checked["stress"] == len(FAST.stress_factors) * FAST.stress_draws
+    assert verdict.scaling["stress"]["points"]
+
+
+def test_stress_allowance():
+    settings = Settings()
+    # Fast reductions always get the floor.
+    assert stress_allowance(settings, 1e-5, 100, 200) == settings.stress_floor_seconds
+    # Slow but polynomial: degree-4 growth with 10x slack.
+    assert stress_allowance(settings, 0.6, 100, 200) == pytest.approx(10 * 0.6 * 16)
+    # A smaller stress input never gets less than the reference allows.
+    assert stress_allowance(settings, 0.6, 100, 50) == pytest.approx(10 * 0.6)
+
+
+# A correct, polynomial but heavy encoding, as GPT-OSS wrote it (test set,
+# clique-to-sat): x(i, p) = "vertex i is the p-th clique member", and every
+# non-adjacent pair is forbidden at every pair of positions: O(n^2 k^2)
+# clauses. On sparse 40-vertex graphs (same input size as dense 20-vertex
+# ones) a call takes ~1.6 s; verifier 1.9's 1 s floor called that
+# superpolynomial.
+POSITION_ENCODING_CLIQUE_TO_SAT = """
+def reduce(instance):
+    n, k = instance["n"], instance["k"]
+    if k <= 0:
+        return {"num_vars": 0, "clauses": []}
+    if k > n:
+        return {"num_vars": 0, "clauses": [[]]}
+    var = lambda i, p: i * k + p + 1
+    adjacent = {frozenset(e) for e in instance["edges"]}
+    clauses = [[var(i, p) for i in range(n)] for p in range(k)]
+    clauses += [[-var(i, p), -var(i, q)] for i in range(n) for p in range(k) for q in range(p + 1, k)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if frozenset((i, j)) not in adjacent:
+                clauses += [[-var(i, p), -var(j, q)] for p in range(k) for q in range(k)]
+    return {"num_vars": n * k, "clauses": clauses}
+"""
+
+
+def test_heavy_polynomial_encoding_is_not_called_superpolynomial(tasks, tmp_path):
+    verdict = run(tasks, tmp_path, POSITION_ENCODING_CLIQUE_TO_SAT, CLIQUE_TO_SAT)
+    assert verdict.status == "correct", verdict.counterexample

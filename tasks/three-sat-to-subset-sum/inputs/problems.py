@@ -118,6 +118,21 @@ def external_sat(clauses) -> bool | None:
         return bool(solver.solve())
 
 
+def fast_decide(name: str, *args):
+    """A fast exact answer from benchmark/problems/fast_paths.py, or None.
+
+    That module is never bundled into a task's problems.py (its CNF
+    encodings would hand agents reductions they are asked to write), so in
+    an agent's sandbox the import fails and callers use their pure-Python
+    search instead. Both paths give the same exact answer.
+    """
+    try:
+        from benchmark.problems.fast_paths import DECIDERS
+    except ImportError:
+        return None
+    return DECIDERS[name](*args)
+
+
 # --- Shared validation helpers ---------------------------------------------
 
 
@@ -342,16 +357,51 @@ def numbers_size(numbers: list[int]) -> int:
 
 
 def subset_sum_reachable(numbers: list[int], target: int) -> bool:
-    """Exact: the set of subset sums up to `target`, built one number at a
-    time. Its size is at most min(2^n, target + 1)."""
+    """Exact, by one of two searches:
+
+    * When few sums are possible (at most 2^16: few numbers or a small
+      target), build the set of reachable sums up to `target`, one number
+      at a time.
+    * Otherwise a depth-first search over the numbers, largest first: take
+      or skip each one, cut a branch as soon as the numbers left cannot
+      reach what remains of the target, and remember (position, remainder)
+      pairs already shown to fail. Instances from reductions (digits in a
+      large base, as in 3-SAT -> Subset Sum) are settled in well under a
+      second this way, where the set of sums would have ~2^40 members.
+    """
     if target < 0:
         return False
-    sums = {0}
-    for number in numbers:
-        sums |= {s + number for s in sums if s + number <= target}
-        if target in sums:
+    positive = sorted((x for x in numbers if x > 0), reverse=True)
+    if target == 0:
+        return True
+    if sum(positive) < target:
+        return False
+    if min(1 << len(positive), target + 1) <= 1 << 16 or len(positive) > 800:
+        sums = {0}
+        for number in positive:
+            sums |= {s + number for s in sums if s + number <= target}
+            if target in sums:
+                return True
+        return target in sums
+
+    left = [0] * (len(positive) + 1)  # left[i] = sum of positive[i:]
+    for i in range(len(positive) - 1, -1, -1):
+        left[i] = left[i + 1] + positive[i]
+    failed: set[tuple[int, int]] = set()
+
+    def search(i: int, remaining: int) -> bool:
+        if remaining == 0:
             return True
-    return target in sums
+        if left[i] < remaining or (i, remaining) in failed:
+            return False
+        if positive[i] <= remaining and search(i + 1, remaining - positive[i]):
+            return True
+        if search(i + 1, remaining):
+            return True
+        failed.add((i, remaining))
+        return False
+
+    return search(0, target)
 
 
 def small_number_lists(scale: int, max_value: int = 3) -> Iterator[list[int]]:
@@ -403,20 +453,36 @@ class SubsetSum(Problem):
     @classmethod
     def random_instance(cls, rng: random.Random, scale: int) -> Instance:
         """scale = how many numbers. Half the targets are the sum of a random
-        sub-list (yes); the rest are random (usually no)."""
+        sub-list (yes); 3 in 10 are random from 0 to sum + 1 (usually no);
+        1 in 10 are negative; 1 in 10 are a power of two above the sum plus
+        a reachable sum (no, but with the low bits of a yes)."""
         numbers = [rng.randint(1, 50) for _ in range(scale)]
-        if rng.random() < 0.5:
+        total = sum(numbers)
+        roll = rng.random()
+        if roll < 0.5:
             target = sum(x for x in numbers if rng.random() < 0.5)
+        elif roll < 0.8:
+            target = rng.randint(0, total + 1)
+        elif roll < 0.9:
+            target = -rng.randint(1, total + 2)
         else:
-            target = rng.randint(0, sum(numbers) + 1)
+            reachable = sum(x for x in numbers if rng.random() < 0.5)
+            target = (1 << (total.bit_length() + rng.randint(1, 3))) + reachable
         return {"numbers": numbers, "target": target}
 
     @classmethod
     def enumerate_instances(cls, scale: int) -> Iterator[Instance]:
         """Small values only (0..3): numbers are unbounded, so 'every
-        instance' means every list and target in that range."""
+        instance' means every list with every target from 0 to sum + 1, plus
+        targets outside that range that the spec allows: two negative ones,
+        and three above the sum (one of them a power of two above the sum,
+        and one that adds 1 to it, which share their low bits with small
+        reachable sums: they catch reductions that drop high bits)."""
         for numbers in small_number_lists(scale):
-            for target in range(sum(numbers) + 2):
+            total = sum(numbers)
+            high = 1 << (total.bit_length() + 1)
+            targets = list(range(total + 2)) + [-1, -(total + 2), 2 * (total + 2), high, high + 1]
+            for target in dict.fromkeys(targets):  # no repeats, order kept
                 yield {"numbers": numbers, "target": target}
 
 

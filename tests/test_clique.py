@@ -16,7 +16,7 @@ K4 = [list(pair) for pair in combinations(range(4), 2)]
 
 def test_interface():
     counts = check_problem(Clique)
-    assert counts["enumerated"] == 6505
+    assert counts["enumerated"] == 8705
 
 
 @pytest.mark.parametrize(

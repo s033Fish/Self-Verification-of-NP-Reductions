@@ -15,7 +15,7 @@ PATH4 = [[0, 1], [1, 2], [2, 3]]
 
 def test_interface():
     counts = check_problem(DominatingSet)
-    assert counts["enumerated"] == 6505
+    assert counts["enumerated"] == 8705
 
 
 @pytest.mark.parametrize(

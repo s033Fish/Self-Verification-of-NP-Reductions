@@ -40,6 +40,7 @@ SOLVER_FUNCTIONS = (
     "min_set_cover",
     "exact_cover_exists",
     "subset_sum_reachable",
+    "fast_decide",
 )
 
 

@@ -15,7 +15,7 @@ STAR = [[0, 1], [0, 2], [0, 3]]
 
 def test_interface():
     counts = check_problem(VertexCover)
-    assert counts["enumerated"] == 6505
+    assert counts["enumerated"] == 8705
 
 
 @pytest.mark.parametrize(

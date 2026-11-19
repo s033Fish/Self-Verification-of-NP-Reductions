@@ -29,11 +29,15 @@ from .tasks import REPO, ReductionTask, load_tasks
 
 RUNNER_APP = "reductions-agent-runner"
 RUNNER_FUNCTION = "run_task"
-CONDITIONS = ("c1", "c2", "c3", "c3n", "c4", "c5")
-IMPLEMENTED = ("c1", "c2", "c3", "c3n")
+CONDITIONS = ("c1", "c2", "c3", "c3n", "c4", "c5", "c5x")
+IMPLEMENTED = CONDITIONS
 # Conditions whose agents get problems_nosolver.py (specs and validate() only)
 # as their problems.py. The verifier always judges with the full library.
-NO_SOLVER_CONDITIONS = {"c3n", "c5"}
+NO_SOLVER_CONDITIONS = {"c3n", "c4", "c5", "c5x"}
+# c5x: the cross-model tester. It reviews the reduce.py of the c5 run with the
+# same task, writer and seed, so c5 and c5x judge identical reductions and only
+# the tester's model differs. Run c5 first.
+REVIEW_CONDITIONS = {"c5x": "c5"}
 NOSOLVER_FILE = "problems_nosolver.py"
 
 
@@ -86,6 +90,22 @@ def build_jobs(
     return jobs
 
 
+def cross_tester(agent: Agent) -> Agent:
+    """The other model: each writer is reviewed by the next agent in AGENTS."""
+    keys = list(AGENT_BY_KEY)
+    return AGENT_BY_KEY[keys[(keys.index(agent.key) + 1) % len(keys)]]
+
+
+def writer_run(job: Job, runs: Path) -> Path:
+    """For a review condition, the run whose writer it reviews."""
+    source = REVIEW_CONDITIONS[job.condition]
+    return runs / job.run_id.replace(f"__{job.condition}__", f"__{source}__", 1)
+
+
+def _read_optional(path: Path) -> str | None:
+    return path.read_text() if path.is_file() else None
+
+
 def problem_spec(task: ReductionTask) -> str:
     """The SOURCE and TARGET docstrings, as the agent sees them in the prompt.
     Taken from the trusted library, which make_task bundles into problems.py."""
@@ -99,7 +119,7 @@ def problem_spec(task: ReductionTask) -> str:
     return "\n\n".join(parts)
 
 
-def build_request(job: Job) -> dict[str, Any]:
+def build_request(job: Job, runs: Path = REPO / "runs") -> dict[str, Any]:
     task = job.task
     input_files = {
         item.name: (job.descriptor.parent / item.path).read_bytes() for item in task.inputs
@@ -109,13 +129,38 @@ def build_request(job: Job) -> dict[str, Any]:
         input_files["problems.py"] = (
             job.descriptor.parent / "inputs" / NOSOLVER_FILE
         ).read_bytes()
+    review: dict[str, Any] = {}
+    if job.condition in REVIEW_CONDITIONS:
+        source = writer_run(job, runs)
+        record = json.loads((source / "result.json").read_text())
+        tester = cross_tester(job.agent)
+        review = {
+            "writer": {
+                "run_id": source.name,
+                "exit_status": record.get("exit_status"),
+                "files": {
+                    "reduce.py": _read_optional(source / "reduce.py"),
+                    "verdict.json": _read_optional(source / "writer_verdict.json"),
+                    "test_reduce.py": _read_optional(source / "writer_test_reduce.py"),
+                },
+            },
+            "tester": {
+                "key": tester.key,
+                "model": tester.model,
+                "temperature": tester.temperature,
+                "max_tokens": tester.max_tokens,
+            },
+        }
     return {
+        **review,
         "run_id": job.run_id,
         "task": {
             "task_id": task.task_id,
             "instructions": task.instructions,
             "inputs": [item.model_dump() for item in task.inputs],
             "spec": problem_spec(task),
+            "source_problem": task.source_problem,
+            "target_problem": task.target_problem,
             "solvers_provided": solvers_provided,
         },
         "model": job.agent.model,
@@ -152,8 +197,10 @@ def write_result(job: Job, runs: Path, result: dict[str, Any]) -> Path:
                 key: _json_safe(result.get(key))
                 for key in (
                     "exit_status", "temperature", "max_tokens", "step_limit", "scaffold", "agent_verified",
-                    "usage", "replies_without_tool_calls", "elapsed_seconds", "prompt",
-                    "outcome", "trajectory",
+                    "usage", "replies_without_tool_calls", "oracle_log", "elapsed_seconds", "prompt",
+                    "outcome", "trajectory", "writer_verified", "tester_first_call",
+                    "tester_exit_status", "tester_prompt", "tester_trajectory",
+                    "tester_model", "writer_run",
                 )
             },
         }
@@ -179,7 +226,9 @@ def main(argv: list[str]) -> None:
         "--conditions", nargs="+", choices=CONDITIONS, default=list(IMPLEMENTED)
     )
     parser.add_argument("--seeds", type=int, default=3)
-    parser.add_argument("--samples", type=int, default=4, help="k for best-of-k (c2)")
+    # k = 3: close to c3n's token cost for both models (dev pilot: a c1 run is
+    # about 35k / 28k tokens, c3n about 70k / 84k for DeepSeek / GPT-OSS).
+    parser.add_argument("--samples", type=int, default=3, help="k for best-of-k (c2)")
     parser.add_argument("--force", action="store_true", help="replace existing runs")
     parser.add_argument(
         "--dry-run", action="store_true", help="list the runs without starting them"
@@ -205,6 +254,15 @@ def main(argv: list[str]) -> None:
         job for job in jobs
         if arguments.force or not (arguments.runs / job.run_id).exists()
     ]
+    missing = [
+        job for job in pending
+        if job.condition in REVIEW_CONDITIONS
+        and not (writer_run(job, arguments.runs) / "result.json").exists()
+    ]
+    if missing:
+        print(f"skipping {len(missing)} review run(s) whose writer run does not exist yet "
+              f"(e.g. {writer_run(missing[0], arguments.runs).name}); generate it first")
+        pending = [job for job in pending if job not in missing]
     print(f"{len(jobs)} run(s) requested, {len(jobs) - len(pending)} already done, "
           f"{len(pending)} to start")
     if arguments.dry_run or not pending:
@@ -218,7 +276,7 @@ def main(argv: list[str]) -> None:
     # order_outputs=False: each run is saved as soon as it finishes. The runner
     # returns failures as {"run_id", "error"} instead of raising.
     results = remote.map(
-        [build_request(job) for job in pending],
+        [build_request(job, arguments.runs) for job in pending],
         order_outputs=False,
         return_exceptions=True,
     )

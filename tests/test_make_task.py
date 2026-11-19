@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -124,3 +125,20 @@ def test_task_json_lists_only_the_agent_visible_file(tmp_path):
     task_dir = write_task(pair, tmp_path)
     descriptor = json.loads((task_dir / "task.json").read_text())
     assert [item["name"] for item in descriptor["inputs"]] == ["problems.py"]
+
+
+def test_bundles_never_contain_the_verifiers_fast_paths(tmp_path):
+    """fast_paths.py holds CNF encodings (3-colouring -> SAT is a task's gold
+    answer). Bundles reach it only through fast_decide, which fails to
+    import it in an agent's sandbox."""
+    import benchmark.problems.fast_paths as fast_paths
+    from benchmark.make_task import load_pairs, write_task
+
+    encoding_line = "clauses.append([var(v, 0), var(v, 1), var(v, 2)])"
+    assert encoding_line in Path(fast_paths.__file__).read_text()
+    for pair in load_pairs():
+        task = write_task(pair, tmp_path)
+        for bundle in (task / "inputs").glob("*.py"):
+            text = bundle.read_text()
+            assert encoding_line not in text, bundle
+            assert "DECIDERS = " not in text, bundle  # the table itself, not the hook's import

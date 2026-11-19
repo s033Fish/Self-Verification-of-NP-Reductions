@@ -311,7 +311,7 @@ FORBIDDEN_IN_NOSOLVER = (
     "_satisfiable", "satisfiable(", "_dpll", "max_independent_set_size",
     "min_dominating_set_size", "three_colourable", "hamiltonian_path_exists",
     "hamiltonian_cycle_exists", "min_set_cover", "exact_cover_exists",
-    "subset_sum_reachable",
+    "subset_sum_reachable", "fast_decide",
 )
 
 NOSOLVER_HEADER = '''"""Problem definitions for this task: {source} -> {target}.

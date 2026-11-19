@@ -30,16 +30,51 @@ def numbers_size(numbers: list[int]) -> int:
 
 
 def subset_sum_reachable(numbers: list[int], target: int) -> bool:
-    """Exact: the set of subset sums up to `target`, built one number at a
-    time. Its size is at most min(2^n, target + 1)."""
+    """Exact, by one of two searches:
+
+    * When few sums are possible (at most 2^16: few numbers or a small
+      target), build the set of reachable sums up to `target`, one number
+      at a time.
+    * Otherwise a depth-first search over the numbers, largest first: take
+      or skip each one, cut a branch as soon as the numbers left cannot
+      reach what remains of the target, and remember (position, remainder)
+      pairs already shown to fail. Instances from reductions (digits in a
+      large base, as in 3-SAT -> Subset Sum) are settled in well under a
+      second this way, where the set of sums would have ~2^40 members.
+    """
     if target < 0:
         return False
-    sums = {0}
-    for number in numbers:
-        sums |= {s + number for s in sums if s + number <= target}
-        if target in sums:
+    positive = sorted((x for x in numbers if x > 0), reverse=True)
+    if target == 0:
+        return True
+    if sum(positive) < target:
+        return False
+    if min(1 << len(positive), target + 1) <= 1 << 16 or len(positive) > 800:
+        sums = {0}
+        for number in positive:
+            sums |= {s + number for s in sums if s + number <= target}
+            if target in sums:
+                return True
+        return target in sums
+
+    left = [0] * (len(positive) + 1)  # left[i] = sum of positive[i:]
+    for i in range(len(positive) - 1, -1, -1):
+        left[i] = left[i + 1] + positive[i]
+    failed: set[tuple[int, int]] = set()
+
+    def search(i: int, remaining: int) -> bool:
+        if remaining == 0:
             return True
-    return target in sums
+        if left[i] < remaining or (i, remaining) in failed:
+            return False
+        if positive[i] <= remaining and search(i + 1, remaining - positive[i]):
+            return True
+        if search(i + 1, remaining):
+            return True
+        failed.add((i, remaining))
+        return False
+
+    return search(0, target)
 
 
 def small_number_lists(scale: int, max_value: int = 3) -> Iterator[list[int]]:

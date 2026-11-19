@@ -51,18 +51,34 @@ class SubsetSum(Problem):
     @classmethod
     def random_instance(cls, rng: random.Random, scale: int) -> Instance:
         """scale = how many numbers. Half the targets are the sum of a random
-        sub-list (yes); the rest are random (usually no)."""
+        sub-list (yes); 3 in 10 are random from 0 to sum + 1 (usually no);
+        1 in 10 are negative; 1 in 10 are a power of two above the sum plus
+        a reachable sum (no, but with the low bits of a yes)."""
         numbers = [rng.randint(1, 50) for _ in range(scale)]
-        if rng.random() < 0.5:
+        total = sum(numbers)
+        roll = rng.random()
+        if roll < 0.5:
             target = sum(x for x in numbers if rng.random() < 0.5)
+        elif roll < 0.8:
+            target = rng.randint(0, total + 1)
+        elif roll < 0.9:
+            target = -rng.randint(1, total + 2)
         else:
-            target = rng.randint(0, sum(numbers) + 1)
+            reachable = sum(x for x in numbers if rng.random() < 0.5)
+            target = (1 << (total.bit_length() + rng.randint(1, 3))) + reachable
         return {"numbers": numbers, "target": target}
 
     @classmethod
     def enumerate_instances(cls, scale: int) -> Iterator[Instance]:
         """Small values only (0..3): numbers are unbounded, so 'every
-        instance' means every list and target in that range."""
+        instance' means every list with every target from 0 to sum + 1, plus
+        targets outside that range that the spec allows: two negative ones,
+        and three above the sum (one of them a power of two above the sum,
+        and one that adds 1 to it, which share their low bits with small
+        reachable sums: they catch reductions that drop high bits)."""
         for numbers in small_number_lists(scale):
-            for target in range(sum(numbers) + 2):
+            total = sum(numbers)
+            high = 1 << (total.bit_length() + 1)
+            targets = list(range(total + 2)) + [-1, -(total + 2), 2 * (total + 2), high, high + 1]
+            for target in dict.fromkeys(targets):  # no repeats, order kept
                 yield {"numbers": numbers, "target": target}
